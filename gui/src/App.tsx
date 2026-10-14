@@ -108,6 +108,33 @@ export default function App() {
     }
   };
 
+  // While the UI is up, a lost daemon shows as "reconnecting" (banner, page
+  // stays mounted) so short gaps — a deliberate restart, the app's watchdog
+  // restarting a crashed daemon — don't throw the user out. Only after
+  // RECONNECT_GRACE failed checks does it become "stopped" and show the
+  // connection screen. This only reports: restarting is the watchdog's job
+  // (src-tauri/src/daemon.rs).
+  const RECONNECT_GRACE = 10; // × 3 s
+  let failedChecks = 0;
+  const watchDaemon = async () => {
+    let up = false;
+    try {
+      up = ((await invoke("get_status")) as any).daemon_running === true;
+    } catch {}
+    if (up) {
+      failedChecks = 0;
+      if (daemonStatus() !== "running") setDaemonStatus("running");
+      return;
+    }
+    failedChecks++;
+    const s = daemonStatus();
+    if (s === "running" || s === "reconnecting") {
+      setDaemonStatus(failedChecks >= RECONNECT_GRACE ? "stopped" : "reconnecting");
+    } else if (s !== "connecting") {
+      setDaemonStatus("stopped");
+    }
+  };
+
   const isInEditableTarget = (e: KeyboardEvent): boolean => {
     const el = e.target as HTMLElement | null;
     if (!el) return false;
@@ -448,9 +475,7 @@ export default function App() {
     startAndWait();
 
     const interval = setInterval(() => {
-      if (daemonStatus() !== "running") {
-        checkDaemon();
-      }
+      if (daemonStatus() !== "connecting") watchDaemon();
     }, 3000);
 
     document.addEventListener("keydown", handleGlobalKeyDown);
@@ -490,7 +515,7 @@ export default function App() {
           <img src="/orca-logo-full.png" alt="Orca" style={{ width: "80px", height: "80px", "border-radius": "18px", opacity: "0.8" }} />
           <div style={{ color: "#8b949e", "font-size": "14px" }}>{startupStep()}</div>
         </div>
-      ) : daemonStatus() !== "running" ? (
+      ) : daemonStatus() !== "running" && daemonStatus() !== "reconnecting" ? (
         <ConnectionScreen status={daemonStatus()} onRetry={checkDaemon} />
       ) : !environmentChecked() ? (
         <div style={{ display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center", height: "calc(100vh - 40px)", gap: "16px" }}>

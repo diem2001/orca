@@ -1,26 +1,92 @@
 //! Daemon lifecycle management — start/stop the orca-daemon process.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
+
+/// Restarts allowed within [`RESTART_WINDOW`] before the watchdog gives up and
+/// leaves it to the user (the connection screen's Start button).
+const MAX_RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(600);
 
 /// Manages the daemon process lifecycle.
 pub struct DaemonManager {
     child: Mutex<Option<Child>>,
+    /// Serializes `start()`: two overlapping starts would each spawn a daemon,
+    /// and storing the second child drops (and so kills) the first.
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 impl DaemonManager {
     pub fn new() -> Self {
         Self {
             child: Mutex::new(None),
+            start_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Restart the daemon this app started if it exits on its own (crash,
+    /// OOM, killed). The only place that restarts after a crash; the
+    /// frontend just shows the state.
+    ///
+    /// Leaves alone: deliberate stops (`stop()` takes the child first, so
+    /// there is nothing to watch), a daemon this app didn't start (a dev
+    /// daemon, one from an earlier app session), and a port that something
+    /// else already answers on.
+    pub fn spawn_watchdog(self: &Arc<Self>) {
+        let dm = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let mut restarts: VecDeque<Instant> = VecDeque::new();
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let exited = {
+                    let Ok(mut guard) = dm.child.lock() else { continue };
+                    match guard.as_mut().map(|c| c.try_wait()) {
+                        Some(Ok(Some(status))) => {
+                            guard.take();
+                            Some(status)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(status) = exited else { continue };
+                tracing::warn!("orca-daemon exited unexpectedly ({status})");
+
+                if dm.health_check().await {
+                    tracing::info!("Another daemon is answering on the port; not restarting");
+                    continue;
+                }
+                let now = Instant::now();
+                while restarts
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) > RESTART_WINDOW)
+                {
+                    restarts.pop_front();
+                }
+                if restarts.len() >= MAX_RESTARTS {
+                    tracing::error!(
+                        "orca-daemon exited {MAX_RESTARTS} times in {} min; not restarting again",
+                        RESTART_WINDOW.as_secs() / 60
+                    );
+                    continue;
+                }
+                restarts.push_back(now);
+                tracing::info!("Restarting orca-daemon");
+                if let Err(e) = dm.start().await {
+                    tracing::error!("Restarting orca-daemon failed: {e}");
+                }
+            }
+        });
     }
 
     /// Start the daemon if not already running.
     /// If a daemon is running but has a different version, restart it.
     pub async fn start(&self) -> Result<(), String> {
+        let _serial = self.start_lock.lock().await;
         // Check if daemon is already responding
         if self.health_check().await {
             // Verify version matches this app
@@ -53,6 +119,8 @@ impl DaemonManager {
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join("daemon.log");
+        // Keep the previous run's log: after a crash it says why.
+        let _ = std::fs::rename(&log_path, log_dir.join("daemon.prev.log"));
         let log_file = std::fs::File::create(&log_path)
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());

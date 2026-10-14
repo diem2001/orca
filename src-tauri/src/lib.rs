@@ -292,6 +292,8 @@ pub fn run() {
                 }
             }
 
+            dm.spawn_watchdog();
+
             // Auto-start daemon in background
             let dm_setup = dm.clone();
             tauri::async_runtime::spawn(async move {
