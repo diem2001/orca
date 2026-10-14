@@ -48,7 +48,7 @@ impl MacOSBackend {
         )?;
 
         Ok(Self {
-            runtime: BollardRuntime::new(docker),
+            runtime: BollardRuntime::new(docker).with_socket(&socket_path),
             socket_path,
             vm_name: vm_name.to_string(),
         })

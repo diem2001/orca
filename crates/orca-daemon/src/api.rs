@@ -7388,6 +7388,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
     let mut connected_version: Option<String> = None;
     let mut connected_method: Option<String> = None;
     let mut connected_docker: Option<bollard::Docker> = None;
+    let mut connected_socket: Option<String> = None;
 
     log.push("Checking Docker connectivity...".to_string());
     log.push("".to_string());
@@ -7405,6 +7406,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                             connected_version = Some(v.clone());
                             connected_method = Some(format!("DOCKER_HOST ({path})"));
                             connected_docker = Some(docker_client);
+                            connected_socket = Some(path.to_string());
                         }
                         None => log.push("  Socket exists but ping failed".to_string()),
                     }
@@ -7499,6 +7501,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                         connected_version = Some(v.clone());
                         connected_method = Some(format!("{label} ({path})"));
                         connected_docker = Some(docker_client);
+                        connected_socket = Some(path.clone());
                     }
                 }
                 None => log.push(format!("Socket {path}: found but ping failed")),
@@ -7556,6 +7559,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                                                 connected_version = Some(v.clone());
                                                 connected_method = Some(format!("Lima VM '{name}' ({socket})"));
                                                 connected_docker = Some(docker_client);
+                                                connected_socket = Some(socket.clone());
                                                 break;
                                             }
                                         }
@@ -7682,7 +7686,11 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
 
     // Hot-swap the runtime if we found a working connection
     if let Some(docker) = connected_docker {
-        let new_runtime = Arc::new(orca_backend_common::BollardRuntime::new(docker));
+        let mut runtime = orca_backend_common::BollardRuntime::new(docker);
+        if let Some(socket) = connected_socket {
+            runtime = runtime.with_socket(socket);
+        }
+        let new_runtime = Arc::new(runtime);
         state.swap_runtime(new_runtime).await;
         log.push("".to_string());
         log.push("\u{2713} Runtime connection updated — Docker is now connected.".to_string());

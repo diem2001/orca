@@ -10,7 +10,6 @@ use orca_core::dev::tenancy::{self, TenancyKind};
 use orca_core::dev::{ComposeModel, DevInstanceState, DevProject};
 use orca_core::runtime::{Container, ContainerRuntime, ContainerState, RuntimeKind};
 use serde::Serialize;
-use tokio::process::Command;
 
 use super::jobs::JobHandle;
 use crate::state::AppState;
@@ -192,7 +191,8 @@ pub async fn exec_sh(state: &AppState, container: &str, cmd: &str) -> Result<Str
         RuntimeKind::Podman => "podman",
         RuntimeKind::Docker => "docker",
     };
-    let out = Command::new(program)
+    let out = super::ops::runtime_cli(state, program)
+        .await
         .args(["exec", container, "sh", "-c", cmd])
         .output()
         .await

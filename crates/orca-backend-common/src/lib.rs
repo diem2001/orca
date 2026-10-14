@@ -21,11 +21,21 @@ pub mod volumes;
 /// Each platform backend embeds this and delegates trait impls to it.
 pub struct BollardRuntime {
     pub docker: bollard::Docker,
+    /// Engine address (`unix:///…/docker.sock`) when connected over a socket.
+    /// Child `docker`/`podman` CLI processes get it as `DOCKER_HOST`, so they
+    /// reach the same engine as the API client whatever the CLI context says.
+    pub host: Option<String>,
 }
 
 impl BollardRuntime {
     pub fn new(docker: bollard::Docker) -> Self {
-        Self { docker }
+        Self { docker, host: None }
+    }
+
+    /// Record the unix socket this runtime is connected through.
+    pub fn with_socket(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.host = Some(format!("unix://{}", path.as_ref().display()));
+        self
     }
 
     /// Detect whether we're talking to Docker or Podman.

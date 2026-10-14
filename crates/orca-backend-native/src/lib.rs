@@ -63,7 +63,7 @@ impl NativeBackend {
             {
                 tracing::info!("Connected to Docker via DOCKER_HOST: {}", sock.display());
                 return Ok(Self {
-                    runtime: BollardRuntime::new(docker),
+                    runtime: BollardRuntime::new(docker).with_socket(&sock),
                     socket_path: sock,
                 });
             }
@@ -83,7 +83,7 @@ impl NativeBackend {
                 {
                     tracing::info!("Connected to Docker via context: {}", sock.display());
                     return Ok(Self {
-                        runtime: BollardRuntime::new(docker),
+                        runtime: BollardRuntime::new(docker).with_socket(&sock),
                         socket_path: sock,
                     });
                 }
@@ -132,7 +132,7 @@ impl NativeBackend {
             if let Some(docker) = try_socket(path_str).await {
                 tracing::info!("Connected to Docker socket at {}", sock.display());
                 return Ok(Self {
-                    runtime: BollardRuntime::new(docker),
+                    runtime: BollardRuntime::new(docker).with_socket(sock),
                     socket_path: sock.clone(),
                 });
             }
@@ -150,7 +150,7 @@ impl NativeBackend {
     pub fn connect_with_socket(path: &str) -> anyhow::Result<Self> {
         let docker = bollard::Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)?;
         Ok(Self {
-            runtime: BollardRuntime::new(docker),
+            runtime: BollardRuntime::new(docker).with_socket(path),
             socket_path: PathBuf::from(path),
         })
     }

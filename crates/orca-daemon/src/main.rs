@@ -737,7 +737,10 @@ async fn finalize_lima_runtime(name: &str, docker: bollard::Docker) -> Arc<orca_
         ensure_sme_masked(&vm).await;
         ensure_static_usernet(&vm).await;
     });
-    Arc::new(orca_backend_common::BollardRuntime::new(docker))
+    let home = std::env::var("HOME").unwrap_or_default();
+    Arc::new(
+        orca_backend_common::BollardRuntime::new(docker).with_socket(format!("{home}/.lima/{name}/sock/docker.sock")),
+    )
 }
 
 /// Bring up Lima and return a working runtime. Handles the

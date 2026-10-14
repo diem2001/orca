@@ -185,6 +185,44 @@ async fn compose_program(state: &AppState) -> (&'static str, &'static str) {
     }
 }
 
+/// A `docker`/`podman` CLI command aimed at the engine the daemon is connected
+/// to. An app started from Finder or the Dock gets a bare PATH
+/// (`/usr/bin:/bin:…`), so add the usual install locations, and pass the
+/// daemon's socket so the CLI doesn't follow a different `docker context`.
+pub async fn runtime_cli(state: &AppState, program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("PATH", cli_path());
+    if let Some(host) = state.rt().await.host.clone() {
+        let var = if program == "podman" {
+            "CONTAINER_HOST"
+        } else {
+            "DOCKER_HOST"
+        };
+        cmd.env(var, host);
+    }
+    cmd
+}
+
+fn cli_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs: Vec<String> = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/opt/podman/bin",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Docker Desktop and Rancher Desktop user-level CLI symlinks.
+    dirs.push(format!("{home}/.docker/bin"));
+    dirs.push(format!("{home}/.rd/bin"));
+    if let Ok(path) = std::env::var("PATH") {
+        dirs.push(path);
+    }
+    dirs.join(":")
+}
+
 pub struct ComposeRun {
     pub success: bool,
     pub stdout: String,
@@ -199,7 +237,8 @@ pub async fn compose(state: &AppState, dir: &Path, args: &[String], job: Option<
     if let Some(j) = job {
         j.log(format!("$ {program} {sub} {}", args.join(" "))).await;
     }
-    let mut child = Command::new(program)
+    let mut child = runtime_cli(state, program)
+        .await
         .arg(sub)
         .args(args)
         .current_dir(dir)
