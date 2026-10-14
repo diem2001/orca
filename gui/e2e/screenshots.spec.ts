@@ -13,13 +13,17 @@ const SCREENSHOT_DIR = process.env.ORCA_SCREENSHOT_DIR ?? path.join(__dirname, "
 // See: crates/orca-daemon/src/main.rs (--host default_value = "127.0.0.1")
 function readApiToken(): string {
   if (process.env.ORCA_API_TOKEN) return process.env.ORCA_API_TOKEN;
-  try {
-    const configPath = path.join(process.env.HOME || "~", ".config/orca/config.json");
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.api_token || "localhost-only-test-token"; // nosemgrep: generic-api-key
-  } catch {
-    return "localhost-only-test-token";
+  const home = process.env.HOME || "~";
+  // Linux, then macOS.
+  for (const rel of [".config/orca/config.json", "Library/Application Support/orca/config.json"]) {
+    try {
+      const config = JSON.parse(fs.readFileSync(path.join(home, rel), "utf-8"));
+      if (config.api_token) return config.api_token;
+    } catch {
+      // try the next location
+    }
   }
+  return "localhost-only-test-token"; // nosemgrep: generic-api-key
 }
 
 const API_TOKEN = readApiToken();
