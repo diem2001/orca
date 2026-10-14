@@ -778,6 +778,7 @@ export default function SettingsPage(props: SettingsPageProps = {}) {
       {
         mcpServers: {
           orca: {
+            type: "http",
             url: "http://127.0.0.1:9477/api/v1/agent/mcp",
             headers: {
               Authorization: `Bearer ${token || "YOUR_TOKEN_HERE"}`,
@@ -1401,7 +1402,8 @@ export default function SettingsPage(props: SettingsPageProps = {}) {
                       MCP Server Config
                     </div>
                     <p style={{ "font-size": "12px", color: "#8b949e", margin: "0 0 8px 0", "line-height": "1.5" }}>
-                      Add this to your Claude Code or Claude Desktop MCP configuration.
+                      Add this to <span class="mono">.mcp.json</span> in a project (Claude Code) or to any MCP client that
+                      supports HTTP servers. Copying fills in your real token.
                     </p>
                     <div style={{ position: "relative" }}>
                       <pre style={{

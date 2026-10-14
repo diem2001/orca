@@ -621,6 +621,7 @@ Add this to your MCP configuration file:
 {
   "mcpServers": {
     "orca": {
+      "type": "http",
       "url": "http://127.0.0.1:9477/api/v1/agent/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_TOKEN_HERE"
