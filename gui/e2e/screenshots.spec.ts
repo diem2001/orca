@@ -5,13 +5,14 @@ import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SCREENSHOT_DIR = path.join(__dirname, "../../screenshots");
+const SCREENSHOT_DIR = process.env.ORCA_SCREENSHOT_DIR ?? path.join(__dirname, "../../screenshots");
 
 // Read API token from local daemon config (Node.js context).
 // This token authenticates to the Orca daemon which ONLY listens on
 // 127.0.0.1:9477 (localhost) — it is not network-accessible.
 // See: crates/orca-daemon/src/main.rs (--host default_value = "127.0.0.1")
 function readApiToken(): string {
+  if (process.env.ORCA_API_TOKEN) return process.env.ORCA_API_TOKEN;
   try {
     const configPath = path.join(process.env.HOME || "~", ".config/orca/config.json");
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
@@ -121,6 +122,18 @@ async function injectTauriBridge(page: Page) {
           get_daemon_log: () => Promise.resolve(""),
           // Version
           get_version: () => Promise.resolve("0.6.1"),
+          // Projects (worktree dev instances)
+          dev_api: () => fetch(DAEMON + args.path, {
+            method: args.method,
+            headers: { ...AUTH, "Content-Type": "application/json" },
+            body: args.body ? JSON.stringify(args.body) : undefined,
+          }).then(async (r) => {
+            const j = await r.json().catch(() => null);
+            if (!r.ok) throw (j && j.error) || "request failed";
+            return j;
+          }),
+          pick_folder: () => Promise.resolve(null),
+          reveal_path: () => Promise.resolve(null),
           // Gateway
           gateway_status: () => Promise.resolve({
             running: true, container_id: "abc123", routes_active: 4,
@@ -491,5 +504,130 @@ test.describe("Orca Desktop Screenshots", () => {
         await screenshot(page, "06b-image-scan");
       }
     }
+  });
+  test("25 - Projects board", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    await screenshot(page, "25-projects");
+  });
+
+  test("26 - Projects instance detail", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    const running = page.locator(".dev-card.dev-card-running").first();
+    const card = (await running.isVisible({ timeout: 1000 }).catch(() => false)) ? running : page.locator(".dev-card").first();
+    if (await card.isVisible({ timeout: 2000 }).catch(() => false)) {
+      // Click the title: links on the card open URLs instead of the drawer.
+      await card.locator(".dev-card-name").click();
+      await page.waitForTimeout(1200);
+      await screenshot(page, "26-projects-instance");
+      await page.getByText("Generated files", { exact: true }).click();
+      await page.waitForTimeout(1500);
+      await screenshot(page, "26b-projects-generated");
+      await page.getByText("Logs", { exact: true }).last().click();
+      await page.waitForTimeout(1500);
+      await screenshot(page, "26c-projects-logs");
+    }
+  });
+
+  test("27 - Projects start dialog", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    const start = page.locator(".dev-card .btn-primary", { hasText: "Start" }).first();
+    if (await start.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await start.click();
+      await page.waitForTimeout(1800);
+      await screenshot(page, "27-projects-start");
+    }
+  });
+  test("28 - Projects setup wizard", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    await page.getByRole("button", { name: "orca.yaml" }).click();
+    await page.waitForTimeout(2500);
+    await screenshot(page, "28-projects-yaml-form");
+    await page.locator(".dev-seg button", { hasText: "YAML" }).first().click();
+    await page.waitForTimeout(2000);
+    await screenshot(page, "28b-projects-yaml-text");
+  });
+
+  test("28c - Projects hostname picker", async ({ page }) => {
+    // Read-only: switches the picker in the form but never saves.
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    await page.getByRole("button", { name: "orca.yaml" }).click();
+    await page.waitForTimeout(2500);
+    const title = page.locator(".dev-section-title", { hasText: "Hostnames" }).first();
+    if (await title.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await title.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(300);
+      await screenshot(page, "28c-projects-hostnames");
+      await page.locator(".dev-option", { hasText: "Flat" }).first().click();
+      await page.waitForTimeout(300);
+      await screenshot(page, "28d-projects-hostnames-flat");
+    }
+  });
+
+  test("29 - Projects data and env tabs", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    const card = page.locator(".dev-card.dev-card-running").first();
+    if (await card.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await card.locator(".dev-card-name").click();
+      await page.waitForTimeout(800);
+      await page.locator(".detail-tab-item", { hasText: "Data" }).click();
+      await page.waitForTimeout(2500);
+      await screenshot(page, "29-projects-data");
+      await page.locator(".detail-tab-item", { hasText: "Env" }).click();
+      await page.waitForTimeout(2000);
+      await screenshot(page, "29b-projects-env");
+    }
+  });
+  // Read-only: never registers a project or saves anything, so it is safe
+  // against a real daemon. The wizard shot needs a project without a dev:
+  // section to already be registered.
+  test("30 - Projects add dialog and setup wizard", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1200);
+    await page.getByRole("button", { name: "Add project" }).click();
+    await page.waitForTimeout(1500);
+    await screenshot(page, "30-projects-add");
+    await page.locator(".modal-close").first().click();
+    // Find a registered project that has no dev: section yet.
+    const setup = page.getByRole("button", { name: "Set up worktrees…" });
+    const tabs = page.locator(".dev-project-tab");
+    for (let i = 0; i < (await tabs.count()); i++) {
+      if (await setup.isVisible({ timeout: 500 }).catch(() => false)) break;
+      await tabs.nth(i).click();
+      await page.waitForTimeout(800);
+    }
+    if (await setup.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await setup.click();
+      await page.waitForSelector(".dev-wizard", { timeout: 15000 });
+      await page.waitForTimeout(2500);
+      const shots = ["30b-wizard-shared", "30c-wizard-data", "30d-wizard-reach", "30e-wizard-presets", "30f-wizard-review"];
+      for (let i = 0; i < shots.length; i++) {
+        await screenshot(page, shots[i]);
+        if (i < shots.length - 1) {
+          await page.locator(".dev-wizard .modal-footer .btn-primary", { hasText: "Next" }).click();
+          await page.waitForTimeout(1500);
+        }
+      }
+    }
+  });
+  test("31 - Projects topology and dashboard", async ({ page }) => {
+    await navigateTo(page, "Projects");
+    await page.waitForTimeout(1500);
+    const tab = page.locator(".dev-project-tab", { hasText: "myapp" });
+    if (await tab.isVisible({ timeout: 800 }).catch(() => false)) await tab.click();
+    await page.waitForTimeout(800);
+    await screenshot(page, "31-projects-board-phase3");
+    await page.locator(".dev-seg button", { hasText: "Topology" }).first().click();
+    await page.waitForTimeout(1000);
+    await screenshot(page, "31b-projects-topology");
+    await page.locator(".dev-seg button", { hasText: "Cards" }).first().click();
+    await navigateTo(page, "Dashboard");
+    await page.waitForTimeout(2000);
+    await screenshot(page, "31c-dashboard");
   });
 });

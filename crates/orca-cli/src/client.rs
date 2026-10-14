@@ -141,6 +141,32 @@ impl DaemonClient {
         format!("{}/api/v1{}", self.base_url, path)
     }
 
+    // --- Generic JSON (used by the dev-instance commands) ---
+
+    pub async fn get_value(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let resp = self.http.get(self.url(path)).send().await.map_err(connect_err)?;
+        json_or_error(resp).await
+    }
+
+    pub async fn post_value(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .map_err(connect_err)?;
+        json_or_error(resp).await
+    }
+
+    pub async fn delete_path(&self, path: &str) -> anyhow::Result<()> {
+        let resp = self.http.delete(self.url(path)).send().await.map_err(connect_err)?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        json_or_error(resp).await.map(|_| ())
+    }
+
     // --- Health ---
 
     pub async fn health(&self) -> anyhow::Result<HealthResponse> {
@@ -449,6 +475,35 @@ impl DaemonClient {
         check_status(&resp)?;
         Ok(resp.json().await?)
     }
+}
+
+fn connect_err(e: reqwest::Error) -> anyhow::Error {
+    if e.is_connect() {
+        anyhow::anyhow!("could not reach the Orca daemon; is Orca running?")
+    } else {
+        e.into()
+    }
+}
+
+/// Parse a JSON body, turning `{"error": "..."}` responses into errors
+/// that carry the daemon's own message.
+async fn json_or_error(resp: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let value: serde_json::Value = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text.clone()))
+    };
+    if status.is_success() {
+        return Ok(value);
+    }
+    let msg = value
+        .get("error")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("error")));
+    anyhow::bail!("{msg}")
 }
 
 fn check_status(resp: &reqwest::Response) -> anyhow::Result<()> {

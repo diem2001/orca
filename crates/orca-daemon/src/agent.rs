@@ -617,7 +617,146 @@ pub async fn execute_tool(
             Ok(serde_json::to_value(releases).unwrap_or_default())
         }
 
+        "instance_status" | "instance_up" | "instance_down" | "instance_logs" | "instance_env"
+        | "instance_db_reset" => instance_tool(state, tool_name, &arguments)
+            .await
+            .map_err(|e| format!("{e:#}")),
+
         _ => Err(format!("Unknown tool: {tool_name}")),
+    }
+}
+
+/// Worktree-instance tools. Agents identify their instance by the worktree
+/// path they work in; Orca works out the project and instance from it.
+async fn instance_tool(
+    state: &Arc<AppState>,
+    tool: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    use crate::dev::{deploy, jobs, project};
+
+    let worktree = args
+        .get("worktree")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'worktree' parameter: pass the absolute path of your git worktree"))?;
+    let (project_id, name, wt) = deploy::resolve_path(state, std::path::Path::new(worktree)).await?;
+    crate::dev::activity::touch(&project_id, &name).await;
+
+    // Wait for a job, then summarise it for the agent.
+    async fn finish(job: jobs::JobHandle) -> serde_json::Value {
+        let id = job.snapshot().await.id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+        loop {
+            let j = jobs::get(&id).await;
+            match j {
+                Some(j) if j.status != jobs::JobStatus::Running || std::time::Instant::now() > deadline => {
+                    let steps: Vec<String> = j
+                        .steps
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{:?}: {}{}",
+                                s.status,
+                                s.label,
+                                s.detail.as_ref().map(|d| format!(" ({d})")).unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    let mut out = serde_json::json!({
+                        "status": j.status,
+                        "steps": steps,
+                        "result": j.result,
+                    });
+                    if let Some(e) = &j.error {
+                        out["error"] = serde_json::json!(e);
+                        let tail: Vec<&String> = j
+                            .log
+                            .iter()
+                            .rev()
+                            .take(40)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        out["log_tail"] = serde_json::json!(tail);
+                    }
+                    return out;
+                }
+                Some(_) => tokio::time::sleep(std::time::Duration::from_millis(800)).await,
+                None => return serde_json::json!({ "status": "unknown", "job": id }),
+            }
+        }
+    }
+
+    match tool {
+        "instance_status" => {
+            let ctx = project::ProjectCtx::load(state, &project_id).await?;
+            let view = project::build_view(state, &ctx, false).await;
+            let inst = view.instances.into_iter().find(|i| i.name == name);
+            Ok(serde_json::json!({
+                "project": project_id,
+                "instance": inst,
+                "shared": view.shared,
+                "env_file": wt.join(".orca").join("env"),
+            }))
+        }
+        "instance_up" => {
+            let data_modes = match args.get("data") {
+                Some(v) if !v.is_null() => {
+                    Some(serde_json::from_value(v.clone()).map_err(|e| anyhow::anyhow!("invalid 'data': {e}"))?)
+                }
+                _ => None,
+            };
+            let opts = deploy::UpOptions {
+                preset: args.get("preset").and_then(|v| v.as_str()).map(str::to_string),
+                build: Some(args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(true)),
+                source: Some("mcp".into()),
+                data_modes,
+            };
+            let job = deploy::up(state.clone(), project_id, name, opts).await?;
+            Ok(finish(job).await)
+        }
+        "instance_down" => {
+            let remove = args.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mode = if remove {
+                deploy::DownMode::Remove
+            } else {
+                deploy::DownMode::Stop
+            };
+            let job = deploy::down(state.clone(), project_id, name, mode).await?;
+            Ok(finish(job).await)
+        }
+        "instance_logs" => {
+            let tail = args.get("tail").and_then(|v| v.as_u64()).unwrap_or(200).min(2000) as u32;
+            let service = args.get("service").and_then(|v| v.as_str());
+            let text = deploy::logs(state, &project_id, &name, service, tail, None).await?;
+            Ok(serde_json::json!({ "logs": text }))
+        }
+        "instance_env" => {
+            let path = wt.join(".orca").join("env");
+            let text = std::fs::read_to_string(&path).map_err(|_| {
+                anyhow::anyhow!(
+                    "{} doesn't exist yet: start the instance with instance_up first",
+                    path.display()
+                )
+            })?;
+            let vars: serde_json::Map<String, serde_json::Value> = text
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect();
+            Ok(serde_json::json!({ "env_file": path, "vars": vars }))
+        }
+        "instance_db_reset" => {
+            let service = args
+                .get("service")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'service' parameter"))?;
+            let job = deploy::data_reset(state.clone(), project_id, name, service.to_string()).await?;
+            Ok(finish(job).await)
+        }
+        _ => anyhow::bail!("unknown instance tool {tool}"),
     }
 }
 

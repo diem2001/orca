@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 mod client;
+mod dev;
 
 #[derive(Parser)]
 #[command(name = "orca", about = "Orca — open source container desktop")]
@@ -10,14 +11,92 @@ struct Cli {
     #[arg(long, global = true, env = "ORCA_TOKEN")]
     token: Option<String>,
 
+    /// Daemon address.
+    #[arg(
+        long,
+        global = true,
+        env = "ORCA_DAEMON_URL",
+        default_value = "http://127.0.0.1:9477"
+    )]
+    daemon_url: String,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show daemon health and runtime info
-    Status,
+    /// Show daemon health, and this worktree's instance when inside a registered project
+    Status {
+        /// List every instance of the project
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output (instance only)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Start this worktree's instance (run inside a registered project)
+    Up {
+        /// Preset from orca.yaml (a named set of services)
+        #[arg(long)]
+        preset: Option<String>,
+        /// Don't rebuild images from this worktree's code
+        #[arg(long)]
+        no_build: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop this worktree's instance
+    Down {
+        /// Also delete its volumes, images, host ports and generated files
+        #[arg(long)]
+        remove: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Logs of this worktree's instance
+    Logs {
+        /// Only this service
+        service: Option<String>,
+        #[arg(long, default_value = "200")]
+        tail: u32,
+        /// Keep printing new lines
+        #[arg(short, long)]
+        follow: bool,
+    },
+
+    /// Print this instance's URLs and ports as shell exports: eval $(orca env)
+    Env,
+
+    /// Run a command against this worktree's instance: starts it if needed and
+    /// passes its URLs and ports in the environment. `orca run -- npm test`
+    Run {
+        /// Preset to start
+        #[arg(long)]
+        preset: Option<String>,
+        /// Run a dev server on this machine as SERVICE: it gets a port in $PORT and
+        /// the service's URL routes to it. `orca run --serve web -- npm run dev`
+        #[arg(long, value_name = "SERVICE")]
+        serve: Option<String>,
+        /// Stop the instance when the command ends
+        #[arg(long)]
+        down: bool,
+        /// Don't start the instance; just pass its env
+        #[arg(long)]
+        no_up: bool,
+        /// The command and its arguments (after --)
+        #[arg(trailing_var_arg = true, required = true)]
+        cmd: Vec<String>,
+    },
+
+    /// Register and list projects for worktree instances
+    Projects {
+        #[command(subcommand)]
+        action: dev::ProjectAction,
+    },
 
     /// Print CLI and daemon version
     Version,
@@ -325,10 +404,27 @@ struct RouteExport {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let client = client::DaemonClient::new("http://127.0.0.1:9477", cli.token)?;
+    let client = client::DaemonClient::new(cli.daemon_url.trim_end_matches('/'), cli.token)?;
 
     match cli.command {
-        Commands::Status => cmd_status(&client).await?,
+        Commands::Status { all, json } => {
+            if !json {
+                cmd_status(&client).await?;
+            }
+            dev::status(&client, all, json).await?
+        }
+        Commands::Up { preset, no_build, json } => dev::up(&client, preset, no_build, json).await?,
+        Commands::Down { remove, json } => dev::down(&client, remove, json).await?,
+        Commands::Logs { service, tail, follow } => dev::logs(&client, service, tail, follow).await?,
+        Commands::Env => dev::env(&client).await?,
+        Commands::Run {
+            preset,
+            serve,
+            down,
+            no_up,
+            cmd,
+        } => dev::run(&client, preset, serve, down, no_up, cmd).await?,
+        Commands::Projects { action } => dev::projects(&client, action).await?,
         Commands::Version => cmd_version(&client).await?,
         Commands::Containers { action } => match action {
             ContainerAction::List => cmd_containers_list(&client).await?,
@@ -1058,6 +1154,8 @@ fn cmd_config_import(file: &str) -> anyhow::Result<()> {
                         port,
                         enabled,
                         path,
+                        owner: r.get("owner").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        sleeping: false,
                     });
                 }
             }

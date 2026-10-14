@@ -38,6 +38,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -243,6 +244,9 @@ pub fn run() {
             commands::gateway_start,
             commands::gateway_stop,
             commands::gateway_list_routes,
+            commands::dev_api,
+            commands::pick_folder,
+            commands::reveal_path,
             commands::gateway_add_route,
             commands::gateway_remove_route,
             commands::gateway_update_route,

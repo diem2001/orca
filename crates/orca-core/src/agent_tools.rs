@@ -329,6 +329,82 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
             parameters: json_schema(json!({})),
             category: "Kubernetes".into(),
         },
+        // === Worktree instances ===
+        ToolDefinition {
+            name: "instance_status".into(),
+            description: "Status of the Orca instance for a git worktree: whether it runs, its URLs, host ports, services, shared services and where its .orca/env file is. Pass the worktree path you are working in. Use this before testing to find the app's URLs.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "worktree": { "type": "string", "description": "Absolute path of the git worktree (your current working directory)" } },
+                "required": ["worktree"]
+            }),
+            category: "Worktree instances".into(),
+        },
+        ToolDefinition {
+            name: "instance_up".into(),
+            description: "Start or rebuild the Orca instance for a git worktree, so this branch's code runs with its own URLs and ports while databases are shared. Waits until it is up and returns URLs, host ports, the env file path, and the error with log tail if it fails. Rebuilds images from the worktree's code by default.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "worktree": { "type": "string", "description": "Absolute path of the git worktree" },
+                    "preset": { "type": "string", "description": "Preset from orca.yaml: a named set of services, e.g. 'test'" },
+                    "rebuild": { "type": "boolean", "description": "Rebuild images from the worktree's code (default true)" },
+                    "data": { "type": "object", "description": "Data mode per shared service, e.g. {\"postgres\": \"own-database\"}. Modes: shared, own-database (a copy just for this worktree), own-server. Use own-database before running migrations or writing test data.", "additionalProperties": { "type": "string", "enum": ["shared", "own-database", "own-server"] } }
+                },
+                "required": ["worktree"]
+            }),
+            category: "Worktree instances".into(),
+        },
+        ToolDefinition {
+            name: "instance_down".into(),
+            description: "Stop the Orca instance for a git worktree. Host ports and settings are kept for the next start. With remove=true also deletes its volumes, images, own databases and generated files.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "worktree": { "type": "string", "description": "Absolute path of the git worktree" },
+                    "remove": { "type": "boolean", "description": "Also delete volumes, images, own databases and .orca files (default false)" }
+                },
+                "required": ["worktree"]
+            }),
+            category: "Worktree instances".into(),
+        },
+        ToolDefinition {
+            name: "instance_logs".into(),
+            description: "Recent logs of the Orca instance for a git worktree, all services interleaved or one service.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "worktree": { "type": "string", "description": "Absolute path of the git worktree" },
+                    "service": { "type": "string", "description": "Only this service" },
+                    "tail": { "type": "integer", "description": "Lines per service (default 200)" }
+                },
+                "required": ["worktree"]
+            }),
+            category: "Worktree instances".into(),
+        },
+        ToolDefinition {
+            name: "instance_env".into(),
+            description: "URLs, host ports and database names of the Orca instance for a git worktree, as key/value pairs (the contents of .orca/env). Use these to point tests or scripts at this worktree's running app.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "worktree": { "type": "string", "description": "Absolute path of the git worktree" } },
+                "required": ["worktree"]
+            }),
+            category: "Worktree instances".into(),
+        },
+        ToolDefinition {
+            name: "instance_db_reset".into(),
+            description: "Reset this worktree's own database in a shared service to a fresh copy of the shared data. Only works when the instance uses own-database mode for that service. Deletes the worktree's changes to that database.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "worktree": { "type": "string", "description": "Absolute path of the git worktree" },
+                    "service": { "type": "string", "description": "Shared service, e.g. postgres" }
+                },
+                "required": ["worktree", "service"]
+            }),
+            category: "Worktree instances".into(),
+        },
     ]
 }
 

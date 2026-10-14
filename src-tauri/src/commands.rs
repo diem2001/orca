@@ -4512,3 +4512,120 @@ pub async fn gateway_set_traefik_mode(
         Err(body)
     }
 }
+
+// --- Worktree dev instances ---
+
+/// Call the daemon's `/dev/*` API. One command instead of one per endpoint;
+/// the path is restricted to `/dev/` so it can't reach anything else.
+#[tauri::command]
+pub async fn dev_api(
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    if !path.starts_with("/dev/") || path.contains("..") {
+        return Err("invalid dev API path".into());
+    }
+    let base = daemon_url();
+    let url = format!("{base}{path}");
+    // Long timeout: plans run `docker compose config`, which can be slow.
+    let c = authed_client_with_timeout(120);
+    let req = match method.as_str() {
+        "GET" => c.get(&url),
+        "POST" => c.post(&url),
+        "PUT" => c.put(&url),
+        "DELETE" => c.delete(&url),
+        _ => return Err(format!("unsupported method {method}")),
+    };
+    let req = match body {
+        Some(b) => req.json(&b),
+        None => req,
+    };
+    let resp = req.send().await.map_err(|e| format!("Daemon connection failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let value: serde_json::Value = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+    };
+    if status.is_success() {
+        Ok(value)
+    } else {
+        Err(value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("request failed ({status})")))
+    }
+}
+
+/// Native folder picker. Returns `None` when cancelled.
+#[tauri::command]
+pub async fn pick_folder(app: tauri::AppHandle, title: Option<String>) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = tokio::task::spawn_blocking(move || {
+        let mut d = app.dialog().file();
+        if let Some(t) = title {
+            d = d.set_title(t);
+        }
+        d.blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Open a folder in the system file manager.
+#[tauri::command]
+pub async fn reveal_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() || !p.is_dir() {
+        return Err(format!("{path} is not a folder"));
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(p).spawn().map_err(|e| format!("could not open {path}: {e}"))?;
+    Ok(())
+}
+
+/// Running worktree instances for the tray menu: (label, urls).
+pub(crate) async fn running_instances_for_tray() -> Vec<(String, Vec<String>)> {
+    let Ok(projects) = get_json::<serde_json::Value>("/dev/projects").await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for p in projects.as_array().into_iter().flatten() {
+        let project = p["id"].as_str().unwrap_or_default();
+        for i in p["instances"].as_array().into_iter().flatten() {
+            let status = i["status"].as_str().unwrap_or_default();
+            if status != "running" && status != "partial" {
+                continue;
+            }
+            let mut urls: Vec<String> = i["routes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| {
+                    let base = r["url"].as_str()?;
+                    let path = r["path"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim_end_matches('*')
+                        .trim_end_matches('/');
+                    Some(format!("{base}{path}"))
+                })
+                .collect();
+            urls.sort();
+            urls.dedup();
+            out.push((format!("{} · {project}", i["name"].as_str().unwrap_or_default()), urls));
+        }
+    }
+    out
+}

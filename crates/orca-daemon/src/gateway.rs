@@ -550,13 +550,26 @@ fn build_caddy_config(config: &GatewayConfig, k8s_routes: &[(String, String)]) -
             } else {
                 serde_json::json!([{"host": [route.hostname.clone()]}])
             };
-            serde_json::json!({
-                "match": match_rule,
-                "handle": [{
+            let handle = if route.sleeping {
+                // Idle-stopped worktree instance: show a page that reloads
+                // itself; Orca sees the request and starts the instance.
+                serde_json::json!([{
+                    "handler": "static_response",
+                    "status_code": 503,
+                    "headers": {
+                        "Content-Type": ["text/html; charset=utf-8"],
+                        "Cache-Control": ["no-store"],
+                        "Retry-After": ["3"]
+                    },
+                    "body": wake_page(route)
+                }])
+            } else {
+                serde_json::json!([{
                     "handler": "reverse_proxy",
                     "upstreams": [{"dial": format!("{}:{}", route.container_name, route.port)}]
-                }]
-            })
+                }])
+            };
+            serde_json::json!({ "match": match_rule, "handle": handle })
         })
         .collect();
 
@@ -628,7 +641,10 @@ fn build_caddy_config(config: &GatewayConfig, k8s_routes: &[(String, String)]) -
     caddy["apps"]["http"]["servers"]["gateway"] = serde_json::json!({
         "listen": [":443"],
         "routes": all_routes,
-        "tls_connection_policies": [{}]
+        "tls_connection_policies": [{}],
+        // Access log (to the container's output) lets Orca tell which
+        // worktree instances are in use, for idle stop.
+        "logs": {}
     });
 
     // HTTP → HTTPS redirect
@@ -652,6 +668,24 @@ fn build_caddy_config(config: &GatewayConfig, k8s_routes: &[(String, String)]) -
     }
 
     serde_json::to_string_pretty(&caddy).unwrap_or_default()
+}
+
+/// The page shown while an idle-stopped instance starts again.
+fn wake_page(route: &orca_core::config::GatewayRoute) -> String {
+    let name = route
+        .owner
+        .as_deref()
+        .and_then(|o| o.strip_prefix("dev:"))
+        .map(|o| o.split('#').next().unwrap_or(o).replace(':', " / "))
+        .unwrap_or_else(|| route.hostname.clone());
+    let name = escape_html(&name);
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3"><title>Starting {name}</title>
+<style>body{{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0e14;color:#e6edf3;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+.box{{text-align:center;max-width:460px;padding:24px}}.spin{{width:28px;height:28px;margin:0 auto 18px;border:3px solid rgba(88,166,255,.25);border-top-color:#58a6ff;border-radius:50%;animation:s .8s linear infinite}}
+@keyframes s{{to{{transform:rotate(360deg)}}}}h1{{font-size:18px;font-weight:600;margin:0 0 8px}}p{{color:#8b949e;line-height:1.5;margin:0}}</style></head>
+<body><div class="box"><div class="spin"></div><h1>Starting {name}</h1><p>Orca stopped this worktree instance while it was unused. It is starting again; this page reloads by itself.</p></div></body></html>"#
+    )
 }
 
 /// Wait for the Caddy admin API to be ready.
@@ -1400,6 +1434,8 @@ mod tests {
             port,
             enabled: true,
             path: None,
+            owner: None,
+            sleeping: false,
         }
     }
 
@@ -1410,6 +1446,8 @@ mod tests {
             port,
             enabled: true,
             path: Some(path.to_string()),
+            owner: None,
+            sleeping: false,
         }
     }
 

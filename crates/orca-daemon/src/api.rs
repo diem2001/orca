@@ -208,6 +208,7 @@ pub async fn auth_middleware(
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(crate::dev::routes())
         .route("/health", get(health))
         .route("/events", get(events_stream))
         // Machines
@@ -485,6 +486,7 @@ fn event_type_name(kind: &orca_core::event::EventKind) -> &'static str {
         VolumeRemoved { .. } => "volume.removed",
         BuildStarted { .. } => "build.started",
         BuildCompleted { .. } => "build.completed",
+        DevInstance { .. } => "dev.instance",
         Unknown => "unknown",
     }
 }
@@ -4885,21 +4887,40 @@ async fn auto_register_gateway_routes(
         let mut config = state.config.lock().await;
         for route in routes {
             let container_name = format!("{}-{}-1", stack_name, route.service);
+            let owner = format!("stack:{stack_name}");
             let gw_route = orca_core::config::GatewayRoute {
                 hostname: route.hostname.clone(),
                 container_name: container_name.clone(),
                 port: route.port,
                 enabled: true,
                 path: route.path.clone(),
+                owner: Some(owner.clone()),
+                sleeping: false,
             };
-            if !config
+            // Redeploying the same stack refreshes its own routes; a route
+            // owned by anything else keeps the hostname, and we say so
+            // instead of silently leaving this stack unreachable.
+            match config
                 .gateway
                 .routes
                 .iter()
-                .any(|r| r.hostname == route.hostname && r.path == route.path)
+                .position(|r| r.hostname == route.hostname && r.path == route.path)
             {
-                config.gateway.routes.push(gw_route.clone());
-                registered.push(gw_route);
+                Some(i) if config.gateway.routes[i].owner.as_deref() == Some(owner.as_str()) => {
+                    config.gateway.routes[i] = gw_route.clone();
+                    registered.push(gw_route);
+                }
+                Some(i) => {
+                    tracing::warn!(
+                        "orca.yaml route {} for stack '{stack_name}' not registered: hostname already routed to {}",
+                        route.hostname,
+                        config.gateway.routes[i].container_name
+                    );
+                }
+                None => {
+                    config.gateway.routes.push(gw_route.clone());
+                    registered.push(gw_route);
+                }
             }
         }
         if !registered.is_empty()
@@ -7868,82 +7889,122 @@ async fn agent_openai_proxy(
     )
 }
 
+/// MCP protocol versions this server speaks, newest first.
+const MCP_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Shown to agents on connect, so they know when Orca is the right tool.
+const MCP_INSTRUCTIONS: &str = "Orca manages this machine's containers, compose stacks, Kubernetes and git worktree instances. \
+If you work in a git worktree of a project registered with Orca, use instance_up with your worktree path to run \
+this branch's code (its own URLs and ports, shared databases), instance_status or instance_env to find its URLs and \
+ports, instance_logs to debug, and instance_down when done. Ask for data={\"postgres\": \"own-database\"} before \
+running migrations or writing test data, so other worktrees are not affected. The other tools inspect and manage \
+containers, images, stacks and Kubernetes directly.";
+
+/// Tools that only read state, so clients may run them without asking.
+fn mcp_read_only(name: &str) -> bool {
+    name.starts_with("list_")
+        || name.starts_with("inspect_")
+        || name.starts_with("k8s_list_")
+        || matches!(
+            name,
+            "container_logs"
+                | "container_stats"
+                | "diagnose_container"
+                | "check_port_availability"
+                | "system_health"
+                | "environment_status"
+                | "k8s_status"
+                | "k8s_pod_logs"
+                | "k8s_get_yaml"
+                | "k8s_helm_list"
+                | "instance_status"
+                | "instance_logs"
+                | "instance_env"
+        )
+}
+
+fn mcp_destructive(name: &str) -> bool {
+    name.starts_with("remove_")
+        || name.starts_with("prune_")
+        || name.starts_with("k8s_delete")
+        || matches!(name, "instance_down" | "instance_db_reset" | "compose_down")
+}
+
 /// MCP (Model Context Protocol) JSON-RPC endpoint.
 ///
 /// Handles:
 /// - `initialize` — server info
 /// - `tools/list` — tool catalog in MCP format
 /// - `tools/call` — execute a tool
-async fn agent_mcp(State(state): State<Arc<AppState>>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+async fn agent_mcp(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
     let jsonrpc = "2.0";
-    let id = body.get("id").cloned().unwrap_or(serde_json::json!(null));
+    let id = body.get("id").cloned();
     let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
+    // Notifications (no id) get no JSON-RPC response: 202 Accepted.
+    let Some(id) = id else {
+        return StatusCode::ACCEPTED.into_response();
+    };
+
+    let reply = |result: serde_json::Value| {
+        Json(serde_json::json!({ "jsonrpc": jsonrpc, "id": id, "result": result })).into_response()
+    };
+
     match method {
-        "initialize" => Json(serde_json::json!({
-            "jsonrpc": jsonrpc,
-            "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": { "listChanged": false },
-                },
-                "serverInfo": {
-                    "name": "orca-daemon",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-            }
-        })),
+        "initialize" => {
+            let requested = body
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let version = MCP_VERSIONS
+                .iter()
+                .find(|v| **v == requested)
+                .copied()
+                .unwrap_or(MCP_VERSIONS[0]);
+            reply(serde_json::json!({
+                "protocolVersion": version,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "orca", "title": "Orca", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": MCP_INSTRUCTIONS,
+            }))
+        }
+
+        "ping" => reply(serde_json::json!({})),
 
         "tools/list" => {
-            let catalog = orca_core::agent_tools::tool_catalog();
-            let tools: Vec<serde_json::Value> = catalog
+            let tools: Vec<serde_json::Value> = orca_core::agent_tools::tool_catalog()
                 .iter()
                 .map(|t| {
                     serde_json::json!({
                         "name": t.name,
                         "description": t.description,
                         "inputSchema": t.parameters,
+                        "annotations": {
+                            "readOnlyHint": mcp_read_only(&t.name),
+                            "destructiveHint": mcp_destructive(&t.name),
+                        },
                     })
                 })
                 .collect();
-            Json(serde_json::json!({
-                "jsonrpc": jsonrpc,
-                "id": id,
-                "result": { "tools": tools }
-            }))
+            reply(serde_json::json!({ "tools": tools }))
         }
 
         "tools/call" => {
             let params = body.get("params").cloned().unwrap_or_default();
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-
             match crate::agent::execute_tool(&state, tool_name, arguments).await {
-                Ok(result) => {
-                    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
-                    Json(serde_json::json!({
-                        "jsonrpc": jsonrpc,
-                        "id": id,
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": text,
-                            }],
-                            "isError": false,
-                        }
-                    }))
-                }
-                Err(err) => Json(serde_json::json!({
-                    "jsonrpc": jsonrpc,
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": err,
-                        }],
-                        "isError": true,
-                    }
+                Ok(result) => reply(serde_json::json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                    "isError": false,
+                })),
+                Err(err) => reply(serde_json::json!({
+                    "content": [{ "type": "text", "text": err }],
+                    "isError": true,
                 })),
             }
         }
@@ -7951,11 +8012,9 @@ async fn agent_mcp(State(state): State<Arc<AppState>>, Json(body): Json<serde_js
         _ => Json(serde_json::json!({
             "jsonrpc": jsonrpc,
             "id": id,
-            "error": {
-                "code": -32601,
-                "message": format!("Method not found: {method}"),
-            }
-        })),
+            "error": { "code": -32601, "message": format!("Method not found: {method}") }
+        }))
+        .into_response(),
     }
 }
 
@@ -8117,6 +8176,8 @@ async fn gateway_add_route(
         port: req.port,
         enabled: true,
         path: req.path.clone(),
+        owner: None,
+        sleeping: false,
     };
     config.gateway.routes.push(route);
     config

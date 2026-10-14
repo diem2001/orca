@@ -18,6 +18,7 @@ import VolumesPage from "./pages/VolumesPage";
 import VolumeDetailPage from "./pages/VolumeDetailPage";
 import NetworksPage from "./pages/NetworksPage";
 import GatewayPage from "./pages/GatewayPage";
+import ProjectsPage from "./pages/ProjectsPage";
 import KubernetesPage from "./pages/KubernetesPage";
 import SettingsPage from "./pages/SettingsPage";
 import EnvironmentPage from "./pages/EnvironmentPage";
@@ -35,7 +36,7 @@ import type { AiAssistantApi } from "./components/AiAssistant";
 import type { EnvironmentStatus } from "./lib/types";
 import KeyboardShortcuts from "./components/KeyboardShortcuts";
 
-export type Page = "fleet" | "dashboard" | "templates" | "containers" | "container-detail" | "stack-detail" | "images" | "builds" | "volumes" | "volume-detail" | "networks" | "gateway" | "kubernetes" | "environment" | "activity" | "settings";
+export type Page = "fleet" | "dashboard" | "projects" | "templates" | "containers" | "container-detail" | "stack-detail" | "images" | "builds" | "volumes" | "volume-detail" | "networks" | "gateway" | "kubernetes" | "environment" | "activity" | "settings";
 
 export default function App() {
   // The AI assistant opens this same App in a second webview via a #ai hash.
@@ -235,6 +236,9 @@ export default function App() {
         case "gateway":
           navigate("gateway");
           break;
+        case "projects":
+          navigate("projects");
+          break;
         case "kubernetes":
           navigate("kubernetes");
           break;
@@ -390,6 +394,29 @@ export default function App() {
       } else if (eventType === "image.pulled" || eventType === "pull" || eventType === "ImagePulled") {
         addEvent({ type: "image.pulled", title: `Image pulled: ${reference}`, severity: "success" });
         showToast(`Image pulled: ${reference}`, "success");
+      } else if (eventType === "DevInstance" || eventType === "dev.instance") {
+        const who =
+          data.source === "mcp" ? "An agent" :
+          data.source === "cli" ? "The CLI" :
+          data.source === "wake" ? "A request" :
+          data.source === "orca" ? "Orca" : "You";
+        const what: Record<string, string> = {
+          up: data.source === "wake" ? (data.succeeded ? "woke up" : "couldn't wake") : data.succeeded ? "started" : "couldn't start",
+          down: data.succeeded ? "stopped" : "couldn't stop",
+          remove: data.succeeded ? "removed" : "couldn't remove",
+          idle_stop: "stopped idle instance",
+          data_reset: "reset the database of",
+        };
+        const title = `${who} ${what[data.action] ?? data.action} ${data.instance} (${data.project})`;
+        const detail = [data.url, data.message?.split("\n")[0]].filter(Boolean).join(" · ") || undefined;
+        addEvent({ type: "dev.instance", title, detail, severity: data.succeeded ? "info" : "error" });
+        // The Projects page already reports what the user did there.
+        if (data.source !== "ui" || !data.succeeded) {
+          showToast(title, data.succeeded ? "info" : "error", {
+            label: "Open Projects",
+            onClick: () => navigate("projects"),
+          });
+        }
       }
     });
 
@@ -511,6 +538,7 @@ export default function App() {
               )}
               {page() === "networks" && <NetworksPage />}
               {page() === "gateway" && <GatewayPage onNavigate={(p) => navigate(p)} />}
+              {page() === "projects" && <ProjectsPage onNavigate={(p) => navigate(p)} />}
               {page() === "kubernetes" && <KubernetesPage />}
               {/* Machine page merged into System Health */}
               {page() === "environment" && <EnvironmentPage />}

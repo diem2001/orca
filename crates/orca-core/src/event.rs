@@ -76,6 +76,22 @@ pub enum EventKind {
         success: bool,
     },
 
+    // Worktree instance events
+    /// An instance operation finished (start, stop, remove, idle stop …).
+    DevInstance {
+        project: String,
+        instance: String,
+        /// "up", "down", "remove", "idle_stop", "data_reset"
+        action: String,
+        succeeded: bool,
+        /// Who asked: "ui", "cli", "mcp" or "orca" (idle stop).
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+
     /// Forward-compat catch-all for events emitted by newer daemons that
     /// older clients don't recognize. Keeps deserialization non-fatal
     /// across version skew.

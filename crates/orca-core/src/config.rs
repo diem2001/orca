@@ -176,6 +176,9 @@ pub struct OrcaConfig {
     /// upstream-Kubernetes default runtime.
     #[serde(default)]
     pub kubernetes_runtime: KubernetesRuntime,
+    /// Git repos registered for worktree dev instances.
+    #[serde(default)]
+    pub dev_projects: Vec<crate::dev::DevProject>,
 }
 
 /// A scheduled container action (e.g., restart every Sunday).
@@ -258,6 +261,15 @@ pub struct GatewayRoute {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Who manages this route. `dev:<project>:<instance>` routes belong to a
+    /// worktree instance and are replaced as a set when it redeploys; `None`
+    /// means the user added it by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The instance behind this route was stopped for being idle: the
+    /// gateway shows a "waking up" page and Orca starts it on request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sleeping: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -514,6 +526,7 @@ impl Default for OrcaConfig {
             gateway: GatewayConfig::default(),
             intercept_docker_desktop_urls: true,
             kubernetes_runtime: KubernetesRuntime::default(),
+            dev_projects: Vec::new(),
         }
     }
 }
@@ -934,6 +947,8 @@ mod tests {
             port: 3000,
             enabled: true,
             path: None,
+            owner: None,
+            sleeping: false,
         };
         let json = serde_json::to_string(&route).expect("serialize");
         let restored: GatewayRoute = serde_json::from_str(&json).expect("deserialize");
@@ -952,6 +967,8 @@ mod tests {
             port: 8080,
             enabled: true,
             path: Some("/api/*".to_string()),
+            owner: None,
+            sleeping: false,
         };
         let json = serde_json::to_string(&route).expect("serialize");
         let restored: GatewayRoute = serde_json::from_str(&json).expect("deserialize");
@@ -966,6 +983,8 @@ mod tests {
             port: 3000,
             enabled: true,
             path: None,
+            owner: None,
+            sleeping: false,
         };
         let json = serde_json::to_string(&route).expect("serialize");
         assert!(

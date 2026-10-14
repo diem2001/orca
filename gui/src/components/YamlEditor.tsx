@@ -1,6 +1,7 @@
 import { createSignal, createEffect, onMount, onCleanup, Show } from "solid-js";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, rectangularSelection } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
 import { yaml } from "@codemirror/lang-yaml";
 import { defaultKeymap, indentWithTab } from "@codemirror/commands";
 import { syntaxHighlighting, defaultHighlightStyle, bracketMatching, foldGutter, HighlightStyle } from "@codemirror/language";
@@ -101,6 +102,10 @@ interface YamlEditorProps {
   onSave?: (value: string) => void;
   onClose?: () => void;
   title?: string;
+  /** Called on every edit with the new text. */
+  onChange?: (value: string) => void;
+  /** Extra CodeMirror extensions (completion, linting …). */
+  extensions?: Extension[];
 }
 
 export default function YamlEditor(props: YamlEditorProps) {
@@ -145,7 +150,9 @@ export default function YamlEditor(props: YamlEditorProps) {
 
       const updateListener = EditorView.updateListener.of((update) => {
         if (update.docChanged) {
-          setModified(update.state.doc.toString() !== initialValue());
+          const text = update.state.doc.toString();
+          setModified(text !== initialValue());
+          props.onChange?.(text);
         }
       });
 
@@ -166,6 +173,7 @@ export default function YamlEditor(props: YamlEditorProps) {
         updateListener,
         EditorView.lineWrapping,
         EditorState.tabSize.of(2),
+        ...(props.extensions ?? []),
       ];
 
       if (props.readOnly) {

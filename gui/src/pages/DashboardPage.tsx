@@ -2,6 +2,8 @@ import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { Container, ContainerStats, Image, ComposeProject, SystemHealth, GatewayStatus, GatewayRoute } from "../lib/types";
 import { useRefresh } from "../lib/useRefresh";
+import { devApi } from "../lib/dev";
+import type { DevProject } from "../lib/dev";
 import { formatBytes } from "../lib/format";
 import { recordMetrics, getDashboardCpuHistory, getDashboardMemHistory, getPerContainerCpuChartHistory, getPerContainerMemChartHistory } from "../lib/metricsStore";
 
@@ -34,6 +36,7 @@ export default function DashboardPage(props: DashboardPageProps) {
 
   const [gatewayStatus, setGatewayStatus] = createSignal<GatewayStatus | null>(null);
   const [gatewayRoutes, setGatewayRoutes] = createSignal<GatewayRoute[]>([]);
+  const [devProjects, setDevProjects] = createSignal<DevProject[] | null>(null);
 
   const [containersState, setContainersState] = createSignal<CardState>("loading");
   const [imagesState, setImagesState] = createSignal<CardState>("loading");
@@ -110,6 +113,17 @@ export default function DashboardPage(props: DashboardPageProps) {
     setHealthState("loading");
     fetchAll();
   };
+  // Worktree instances: a quick view of what's running per project.
+  const loadProjects = () => devApi.listProjects(false).then(setDevProjects).catch(() => setDevProjects([]));
+  onMount(() => {
+    loadProjects();
+    const t = setInterval(loadProjects, 10000);
+    onCleanup(() => clearInterval(t));
+  });
+  const devRunning = () =>
+    (devProjects() ?? []).flatMap((p) => p.instances ?? []).filter((i) => i.status === "running" || i.status === "partial").length;
+  const devTotal = () => (devProjects() ?? []).reduce((n, p) => n + (p.instances ?? []).length, 0);
+
   onMount(() => {
     document.addEventListener("orca-host-switch", handleHostSwitch);
     // Keep the metrics store bounded: prune any container ids we no longer
@@ -350,6 +364,37 @@ export default function DashboardPage(props: DashboardPageProps) {
             </div>
           )}
         </Show>
+
+        <div
+          class="dashboard-stat-card"
+          style={{ cursor: "pointer" }}
+          onClick={() => props.onNavigate?.("projects")}
+          title="Go to Projects"
+        >
+          <div class="dashboard-stat-label">Worktree instances</div>
+          <Show
+            when={(devProjects()?.length ?? 0) > 0}
+            fallback={
+              <>
+                <div class="dashboard-stat-value" style={{ "font-size": "14px", color: "#8b949e" }}>No projects</div>
+                <div class="dashboard-stat-sub">Run each git worktree as its own copy of the app</div>
+              </>
+            }
+          >
+            <div class="dashboard-stat-value">
+              {devRunning()}
+              <span style={{ "font-size": "13px", color: "#8b949e", "font-weight": 400 }}> / {devTotal()} running</span>
+            </div>
+            <div class="dashboard-stat-sub">
+              {(devProjects() ?? [])
+                .map((p) => {
+                  const n = (p.instances ?? []).filter((i) => i.status === "running" || i.status === "partial").length;
+                  return `${p.id}${n ? ` (${n})` : ""}`;
+                })
+                .join(" · ")}
+            </div>
+          </Show>
+        </div>
 
         <div
           class="dashboard-stat-card"
