@@ -1474,17 +1474,26 @@ pub async fn add_host_route(state: &AppState, project_id: &str, name: &str, serv
         }
     };
     override_gen::validate_hostname(&hostname)?;
-    let owner = format!("{}#host", owner(project_id, name));
+    let me = owner(project_id, name);
+    let owner = format!("{me}#host");
     let gw_config = {
         let mut cfg = state.config.lock().await;
         cfg.gateway
             .routes
             .retain(|r| !(r.owner.as_deref() == Some(owner.as_str()) && r.hostname == hostname));
+        // The instance's own container for this service steps aside while the
+        // host server runs (`orca run --serve` starts the instance first);
+        // `remove_host_route` turns its route back on.
+        for r in cfg.gateway.routes.iter_mut() {
+            if r.hostname == hostname && r.path.is_none() && r.owner.as_deref() == Some(me.as_str()) {
+                r.enabled = false;
+            }
+        }
         if let Some(other) = cfg
             .gateway
             .routes
             .iter()
-            .find(|r| r.hostname == hostname && r.path.is_none())
+            .find(|r| r.hostname == hostname && r.path.is_none() && r.enabled)
         {
             anyhow::bail!(
                 "{hostname} is already routed to {}; stop that first or set a hostname override for {service}",
@@ -1507,6 +1516,10 @@ pub async fn add_host_route(state: &AppState, project_id: &str, name: &str, serv
         crate::gateway::start(state, &gw_config)
             .await
             .context("could not start the gateway")?;
+    } else {
+        crate::gateway::ensure_host_alias(state, &gw_config)
+            .await
+            .context("could not restart the gateway")?;
     }
     crate::gateway::apply_config(&gw_config).await?;
     let url = if gw_config.https_port == 443 {
@@ -1523,7 +1536,8 @@ pub async fn add_host_route(state: &AppState, project_id: &str, name: &str, serv
 }
 
 pub async fn remove_host_route(state: &AppState, project_id: &str, name: &str, service: &str) -> Result<()> {
-    let owner = format!("{}#host", owner(project_id, name));
+    let me = owner(project_id, name);
+    let owner = format!("{me}#host");
     let ctx = ProjectCtx::load(state, project_id).await?;
     let path = ctx.path_of(name)?;
     let port = ctx
@@ -1532,9 +1546,21 @@ pub async fn remove_host_route(state: &AppState, project_id: &str, name: &str, s
         .and_then(|s| s.host_services.get(service).copied());
     let gw = {
         let mut cfg = state.config.lock().await;
+        let removed: Vec<String> = cfg
+            .gateway
+            .routes
+            .iter()
+            .filter(|r| r.owner.as_deref() == Some(owner.as_str()) && Some(r.port) == port)
+            .map(|r| r.hostname.clone())
+            .collect();
         cfg.gateway
             .routes
             .retain(|r| !(r.owner.as_deref() == Some(owner.as_str()) && Some(r.port) == port));
+        for r in cfg.gateway.routes.iter_mut() {
+            if r.owner.as_deref() == Some(me.as_str()) && removed.contains(&r.hostname) {
+                r.enabled = true;
+            }
+        }
         cfg.save()?;
         cfg.gateway.clone()
     };

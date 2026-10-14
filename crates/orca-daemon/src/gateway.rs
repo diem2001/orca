@@ -184,11 +184,7 @@ pub async fn start(state: &AppState, config: &GatewayConfig) -> Result<String> {
         memory_swap: None,
         gpu: false,
         user: None,
-        extra_hosts: if cfg!(target_os = "linux") {
-            vec!["host.docker.internal:host-gateway".to_string()]
-        } else {
-            vec![]
-        },
+        extra_hosts: host_alias(rt.host.as_deref()),
     };
 
     let id = rt
@@ -524,6 +520,50 @@ fn generate_cert_for_hostname(hostname: &str) -> Result<()> {
 
     tracing::info!("Generated TLS certificate for {hostname}");
     Ok(())
+}
+
+/// Recreate a running gateway that predates [`host_alias`], so host dev
+/// servers become reachable without the user restarting it by hand.
+pub async fn ensure_host_alias(state: &AppState, config: &GatewayConfig) -> Result<()> {
+    let rt = state.rt().await;
+    let want = host_alias(rt.host.as_deref());
+    if want.is_empty() {
+        return Ok(());
+    }
+    let Ok(info) = rt.docker.inspect_container(CADDY_CONTAINER, None).await else {
+        return Ok(());
+    };
+    let have = info.host_config.and_then(|h| h.extra_hosts).unwrap_or_default();
+    if want.iter().all(|w| have.contains(w)) {
+        return Ok(());
+    }
+    tracing::info!("Recreating the gateway so it can reach host dev servers");
+    stop(state).await?;
+    start(state, config).await?;
+    for route in config.routes.iter().filter(|r| r.enabled) {
+        if let Err(e) = ensure_network_connectivity(state, &route.container_name).await {
+            tracing::warn!("gateway could not reach {}: {e}", route.container_name);
+        }
+    }
+    Ok(())
+}
+
+/// `/etc/hosts` entry that lets the gateway reach this computer as
+/// `host.docker.internal` (host dev servers, Traefik).
+///
+/// Linux: `host-gateway` is the host. In a Lima VM `host-gateway` is the VM,
+/// and the name comes from Lima's DNS, which never answers its AAAA query: Go
+/// (Caddy) waits for both and fails with "i/o timeout". The Mac is at Lima's
+/// fixed user-network gateway, so pin that. Docker Desktop resolves the name
+/// itself.
+fn host_alias(docker_host: Option<&str>) -> Vec<String> {
+    if cfg!(target_os = "linux") {
+        vec!["host.docker.internal:host-gateway".to_string()]
+    } else if docker_host.is_some_and(|h| h.contains("/.lima/")) {
+        vec!["host.docker.internal:192.168.5.2".to_string()]
+    } else {
+        vec![]
+    }
 }
 
 /// Get the upstream host address for reaching Traefik from the Caddy container.
@@ -1443,6 +1483,20 @@ fn write_landing_page(config: &GatewayConfig) -> Result<()> {
 mod tests {
     use super::*;
     use orca_core::config::*;
+
+    #[test]
+    fn host_alias_per_engine() {
+        let lima = host_alias(Some("unix:///Users/me/.lima/orca/sock/docker.sock"));
+        let desktop = host_alias(Some("unix:///Users/me/.docker/run/docker.sock"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(lima, ["host.docker.internal:host-gateway"]);
+            assert_eq!(desktop, ["host.docker.internal:host-gateway"]);
+        } else {
+            assert_eq!(lima, ["host.docker.internal:192.168.5.2"]);
+            assert!(desktop.is_empty());
+            assert!(host_alias(None).is_empty());
+        }
+    }
 
     fn make_config(routes: Vec<GatewayRoute>) -> GatewayConfig {
         GatewayConfig {
