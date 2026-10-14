@@ -66,6 +66,7 @@ export default function KeyboardShortcuts(props: KeyboardShortcutsProps) {
   return (
     <div
       data-overlay="true"
+      data-own-escape
       onMouseDown={handleOverlayMouseDown}
       onClick={handleOverlayClick}
       style={{

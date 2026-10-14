@@ -114,6 +114,7 @@ export default function ConfirmDialog() {
         return (
           <div
             class="modal-overlay"
+            data-own-escape
             onMouseDown={(e) => {
               mouseDownOnOverlay = (e.target as HTMLElement).classList.contains("modal-overlay");
             }}

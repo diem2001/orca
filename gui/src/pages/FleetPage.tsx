@@ -825,6 +825,7 @@ function CompareModal(props: CompareModalProps) {
 
   return (
     <div
+      data-own-escape
       onClick={(e) => { if (e.target === e.currentTarget) props.onClose(); }}
       style={{
         position: "fixed", inset: "0", "z-index": "9999",

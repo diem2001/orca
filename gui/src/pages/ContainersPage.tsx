@@ -13,6 +13,7 @@ import LastUpdated from "../components/LastUpdated";
 import { recordMetrics } from "../lib/metricsStore";
 import { logError } from "../lib/activityStore";
 import MultiLogViewer from "../components/MultiLogViewer";
+import { closeOnEscape } from "../lib/closeOnEscape";
 
 interface ContainersPageProps {
   onNavigate?: (page: string) => void;
@@ -40,6 +41,13 @@ export default function ContainersPage(props: ContainersPageProps) {
   let hasAutoExpanded = false;
   const [menuOpen, setMenuOpen] = createSignal<string | null>(null);
   const [containerMenuOpen, setContainerMenuOpen] = createSignal<string | null>(null);
+  closeOnEscape(
+    () => menuOpen() !== null || containerMenuOpen() !== null,
+    () => {
+      setMenuOpen(null);
+      setContainerMenuOpen(null);
+    },
+  );
   const [selected, setSelected] = createSignal<Set<string>>(new Set());
   const [batchDeleteProgress, setBatchDeleteProgress] = createSignal<{ done: number; total: number } | null>(null);
   const [showMultiLog, setShowMultiLog] = createSignal(false);

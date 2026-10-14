@@ -48,7 +48,7 @@ export default function InstanceDrawer(props: Props) {
   ];
 
   return (
-    <div class="dev-drawer-overlay" onClick={props.onClose}>
+    <div class="dev-drawer-overlay" data-own-escape onClick={props.onClose}>
       <div class="dev-drawer" onClick={(e) => e.stopPropagation()}>
         <div class="dev-drawer-header">
           <div style={{ flex: 1, "min-width": 0 }}>

@@ -185,7 +185,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
   });
 
   return (
-    <div class="command-palette-overlay" onMouseDown={(e) => { (e.currentTarget as any).__mdOverlay = e.target === e.currentTarget; }} onClick={(e) => { if ((e.currentTarget as any).__mdOverlay && e.target === e.currentTarget) props.onClose(); (e.currentTarget as any).__mdOverlay = false; }}>
+    <div class="command-palette-overlay" data-own-escape onMouseDown={(e) => { (e.currentTarget as any).__mdOverlay = e.target === e.currentTarget; }} onClick={(e) => { if ((e.currentTarget as any).__mdOverlay && e.target === e.currentTarget) props.onClose(); (e.currentTarget as any).__mdOverlay = false; }}>
       <div class="command-palette">
         <input
           ref={inputRef}

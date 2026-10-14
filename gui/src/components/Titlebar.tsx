@@ -4,6 +4,7 @@ import { showToast } from "./Toast";
 import { getAlertEvents, getUnreadCount, markAllRead, clearEvents } from "../lib/activityStore";
 import { openAiWindow } from "./AiAssistant";
 import type { SystemHealth, RemoteHost, ActiveHost } from "../lib/types";
+import { closeOnEscape } from "../lib/closeOnEscape";
 
 interface TitlebarProps {
   daemonStatus: string;
@@ -30,6 +31,13 @@ export default function Titlebar(props: TitlebarProps) {
   const [runtimeInfo, setRuntimeInfo] = createSignal<string | null>(null);
   const [bellOpen, setBellOpen] = createSignal(false);
   const [hostMenuOpen, setHostMenuOpen] = createSignal(false);
+  closeOnEscape(
+    () => bellOpen() || hostMenuOpen(),
+    () => {
+      setBellOpen(false);
+      setHostMenuOpen(false);
+    },
+  );
   const [remoteHosts, setRemoteHosts] = createSignal<RemoteHost[]>([]);
   const [activeHost, setActiveHost] = createSignal<ActiveHost>({ id: null, name: "Local", url: "", is_remote: false });
 

@@ -236,7 +236,7 @@ export default function RunContainerDialog(props: RunContainerDialogProps) {
   };
 
   return (
-    <div class="modal-overlay" onMouseDown={handleOverlayMouseDown} onClick={handleOverlayClick}>
+    <div class="modal-overlay" data-own-escape onMouseDown={handleOverlayMouseDown} onClick={handleOverlayClick}>
       <div class="modal-dialog">
         <div class="modal-header">
           <h2 class="modal-title">Run Container</h2>

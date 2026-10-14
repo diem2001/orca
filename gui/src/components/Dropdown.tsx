@@ -1,4 +1,5 @@
 import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
+import { closeOnEscape } from "../lib/closeOnEscape";
 
 interface DropdownOption {
   value: string;
@@ -15,6 +16,7 @@ interface DropdownProps {
 
 export default function Dropdown(props: DropdownProps) {
   const [open, setOpen] = createSignal(false);
+  closeOnEscape(open, () => setOpen(false));
   let wrapperRef: HTMLDivElement | undefined;
 
   const selectedLabel = () =>

@@ -1,4 +1,5 @@
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect } from "solid-js";
+import { closeOnEscape } from "../lib/closeOnEscape";
 import { invoke } from "@tauri-apps/api/core";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import { showToast } from "../components/Toast";
@@ -55,6 +56,7 @@ export default function KubernetesPage() {
   const [k8sRuntime, setK8sRuntime] = createSignal<string>("docker");
   const [portForwards, setPortForwards] = createSignal<Set<string>>(new Set());
   const [k8sMenuOpen, setK8sMenuOpen] = createSignal(false);
+  closeOnEscape(k8sMenuOpen, () => setK8sMenuOpen(false));
   const [scaleTarget, setScaleTarget] = createSignal<{ namespace: string; name: string; current: number } | null>(null);
   const [scaleValue, setScaleValue] = createSignal(1);
   const [portForwardEditing, setPortForwardEditing] = createSignal<string | null>(null);
