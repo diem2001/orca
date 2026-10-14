@@ -558,6 +558,15 @@ export default function ContainersPage(props: ContainersPageProps) {
   // When Docker returns host RAM as the limit, small containers show < 1%
   const hasRealMemLimit = (s: ContainerStats) => memPercent(s) > 1;
 
+  // Inside a stack the stack name is already the group header, so show
+  // "clickhouse" for "ai-platform-clickhouse" (and "web-1" for "shop-web-1").
+  const shortName = (c: Container, stackName?: string) => {
+    if (stackName && c.name.startsWith(stackName + "-") && c.name.length > stackName.length + 1) {
+      return c.name.slice(stackName.length + 1);
+    }
+    return c.name;
+  };
+
   const containerRow = (c: Container, stackName?: string) => {
     const cStats = () => inlineStats()[c.id];
     return (
@@ -583,11 +592,13 @@ export default function ContainersPage(props: ContainersPageProps) {
             style={{ cursor: "pointer", "accent-color": "#58a6ff" }}
           />
         </td>
-        <td style={{ "padding-left": stackName ? "44px" : "16px" }}>
+        <td style={{ "padding-left": stackName ? "44px" : "16px", "white-space": "nowrap" }}>
           <span class={c.state === "Running" ? "state-indicator-running" : "state-indicator-stopped"}>
             {c.state === "Running" ? "\u25B6" : "\u25B7"}
           </span>
-          <span style={{ "font-weight": "500", "margin-left": "6px" }}>{c.name}</span>
+          <span style={{ "font-weight": "500", "margin-left": "6px" }} title={c.name}>
+            {shortName(c, stackName)}
+          </span>
           <For each={gatewayRoutes().filter((r) => r.container_name === c.name)}>
             {(route) => (
               <span
@@ -611,7 +622,7 @@ export default function ContainersPage(props: ContainersPageProps) {
             )}
           </For>
         </td>
-        <td class="mono" style={{ color: "#8b949e", "max-width": "280px", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }} title={c.image}>
+        <td class="mono" style={{ color: "#8b949e", "max-width": "220px", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }} title={c.image}>
           {c.image.startsWith("sha256:") ? c.image.slice(0, 19) + "..." : c.image}
         </td>
         <td>
@@ -663,22 +674,19 @@ export default function ContainersPage(props: ContainersPageProps) {
             </span>
           }>
             {(s) => (
-              <ResourceBar value={s().cpu_percent} label={`${s().cpu_percent.toFixed(1)}%`} />
-            )}
-          </Show>
-        </td>
-        <td>
-          <Show when={c.state === "Running" && cStats()} fallback={
-            <span style={{ color: "#484f58", "font-size": "11px" }}>
-              {c.state === "Running" ? "-" : "\u2014"}
-            </span>
-          }>
-            {(s) => (
-              <Show when={hasRealMemLimit(s())} fallback={
-                <span style={{ "font-size": "11px", color: "#8b949e" }}>{formatBytes(s().memory_usage_bytes)}</span>
-              }>
-                <ResourceBar value={memPercent(s())} label={formatBytes(s().memory_usage_bytes)} />
-              </Show>
+              <div class="usage-cell">
+                <span class="usage-key">CPU</span>
+                <ResourceBar value={s().cpu_percent} label={`${s().cpu_percent.toFixed(1)}%`} />
+                <span class="usage-key">MEM</span>
+                <Show when={hasRealMemLimit(s())} fallback={
+                  <div class="inline-resource">
+                    <span class="usage-bar-spacer" />
+                    <span class="resource-bar-label">{formatBytes(s().memory_usage_bytes)}</span>
+                  </div>
+                }>
+                  <ResourceBar value={memPercent(s())} label={formatBytes(s().memory_usage_bytes)} />
+                </Show>
+              </div>
             )}
           </Show>
         </td>
@@ -1062,8 +1070,7 @@ export default function ContainersPage(props: ContainersPageProps) {
                             <th>Name</th>
                             <th>Image</th>
                             <th>State</th>
-                            <th>CPU</th>
-                            <th>Memory</th>
+                            <th>Usage</th>
                             <th>Ports</th>
                             <th>Net I/O</th>
                             <th style={{ "text-align": "right" }}>Actions</th>
@@ -1135,8 +1142,7 @@ export default function ContainersPage(props: ContainersPageProps) {
                         <th>Name</th>
                         <th>Image</th>
                         <th>State</th>
-                        <th>CPU</th>
-                        <th>Memory</th>
+                        <th>Usage</th>
                         <th>Ports</th>
                         <th>Net I/O</th>
                         <th style={{ "text-align": "right" }}>Actions</th>

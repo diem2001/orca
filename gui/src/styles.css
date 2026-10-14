@@ -4127,3 +4127,25 @@ select option {
 .dev-topo-shared-label { font-size: 10.5px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
 .dev-topo-shared-svc { display: flex; gap: 7px; align-items: center; font-size: 12.5px; color: #e6edf3; padding: 4px 10px; border: 1px solid #21262d; border-radius: 8px; }
 .dev-topo-shared-svc span { color: #8b949e; font-size: 11px; }
+
+/* CPU and memory in one table cell: two compact rows. */
+.usage-cell {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  justify-content: start;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+}
+
+.usage-cell .usage-key {
+  font-size: 10px;
+  color: #6e7681;
+  letter-spacing: 0.04em;
+}
+
+.usage-cell .resource-bar,
+.usage-cell .usage-bar-spacer {
+  min-width: 48px;
+  width: 48px;
+}
