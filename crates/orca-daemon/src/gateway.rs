@@ -618,12 +618,13 @@ fn build_caddy_config(config: &GatewayConfig, k8s_routes: &[(String, String)]) -
     });
 
     // Landing page fallback route (served when no hostname matches or at root domain)
+    // Every path gets index.html: /certs also holds private keys and the
+    // Caddy config, none of which may be served.
     let landing_route = serde_json::json!({
-        "handle": [{
-            "handler": "file_server",
-            "root": "/certs",
-            "index_names": ["index.html"]
-        }]
+        "handle": [
+            {"handler": "rewrite", "uri": "/index.html"},
+            {"handler": "file_server", "root": "/certs"}
+        ]
     });
 
     // Add a cert for the root domain so the landing page works over HTTPS
@@ -1473,8 +1474,10 @@ mod tests {
         let routes = gateway["routes"].as_array().unwrap();
         // Only the landing page fallback route (no reverse_proxy routes)
         assert_eq!(routes.len(), 1);
-        let handler = &routes[0]["handle"][0]["handler"];
-        assert_eq!(handler, "file_server");
+        // The fallback only ever serves index.html: /certs holds private keys.
+        assert_eq!(routes[0]["handle"][0]["handler"], "rewrite");
+        assert_eq!(routes[0]["handle"][0]["uri"], "/index.html");
+        assert_eq!(routes[0]["handle"][1]["handler"], "file_server");
 
         // HTTP redirect server should exist
         let redirect = &caddy["apps"]["http"]["servers"]["http_redirect"];
