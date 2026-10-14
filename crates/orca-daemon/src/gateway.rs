@@ -338,6 +338,14 @@ fn to_docker_mount_path(path: &std::path::Path) -> String {
     }
 }
 
+/// Gateway access log, in the certs dir (the only folder mounted into the
+/// gateway). Caddy rolls it at 10 MB and keeps two old files.
+const ACCESS_LOG: &str = "access.log";
+
+pub fn access_log_path() -> std::path::PathBuf {
+    certs_dir().join(ACCESS_LOG)
+}
+
 fn certs_dir() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -618,8 +626,8 @@ fn build_caddy_config(config: &GatewayConfig, k8s_routes: &[(String, String)]) -
     });
 
     // Landing page fallback route (served when no hostname matches or at root domain)
-    // Every path gets index.html: /certs also holds private keys and the
-    // Caddy config, none of which may be served.
+    // Every path gets index.html: /certs also holds private keys, the Caddy
+    // config and the access log, none of which may be served.
     let landing_route = serde_json::json!({
         "handle": [
             {"handler": "rewrite", "uri": "/index.html"},
@@ -643,9 +651,28 @@ fn build_caddy_config(config: &GatewayConfig, k8s_routes: &[(String, String)]) -
         "listen": [":443"],
         "routes": all_routes,
         "tls_connection_policies": [{}],
-        // Access log (to the container's output) lets Orca tell which
-        // worktree instances are in use, for idle stop.
+        // Access log lets Orca tell which worktree instances are in use
+        // (idle stop, wake on request); written to ACCESS_LOG below.
         "logs": {}
+    });
+    // Access lines go to a rotated file instead of the container output,
+    // which Docker would otherwise keep growing for the container's life.
+    caddy["logging"] = serde_json::json!({
+        "logs": {
+            "default": {"exclude": ["http.log.access"]},
+            "access": {
+                "include": ["http.log.access"],
+                "encoder": {"format": "json"},
+                "writer": {
+                    "output": "file",
+                    "filename": format!("/certs/{ACCESS_LOG}"),
+                    "roll_size_mb": 10,
+                    "roll_keep": 2,
+                    // Caddy runs as root in the container; the daemon reads this.
+                    "mode": "0644"
+                }
+            }
+        }
     });
 
     // HTTP → HTTPS redirect
@@ -1478,6 +1505,11 @@ mod tests {
         assert_eq!(routes[0]["handle"][0]["handler"], "rewrite");
         assert_eq!(routes[0]["handle"][0]["uri"], "/index.html");
         assert_eq!(routes[0]["handle"][1]["handler"], "file_server");
+        // Access lines go to a rotated file, not the container output.
+        let access = &caddy["logging"]["logs"]["access"];
+        assert_eq!(access["writer"]["output"], "file");
+        assert_eq!(access["writer"]["filename"], "/certs/access.log");
+        assert_eq!(caddy["logging"]["logs"]["default"]["exclude"][0], "http.log.access");
 
         // HTTP redirect server should exist
         let redirect = &caddy["apps"]["http"]["servers"]["http_redirect"];

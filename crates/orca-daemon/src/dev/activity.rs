@@ -5,12 +5,11 @@
 //! set `idle_stop` in orca.yaml have instances stopped after that long
 //! without use; nothing is deleted and a start brings them back as they were.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use super::{deploy, jobs, project::ProjectCtx};
@@ -43,25 +42,21 @@ pub fn spawn(state: Arc<AppState>) {
     // Fast loop: wake sleeping instances when their URL is requested.
     let wake_state = state.clone();
     tokio::spawn(async move {
-        let mut since = Utc::now().timestamp();
+        let mut cursor = LogCursor::default();
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            let now = Utc::now().timestamp();
-            if let Err(e) = wake_requested(&wake_state, since).await {
+            if let Err(e) = wake_requested(&wake_state, &mut cursor).await {
                 tracing::debug!("wake on request: {e:#}");
             }
-            since = now;
         }
     });
     tokio::spawn(async move {
-        let mut since = Utc::now().timestamp();
+        let mut cursor = LogCursor::default();
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            let now = Utc::now().timestamp();
-            if let Err(e) = scan_gateway(&state, since).await {
+            if let Err(e) = scan_gateway(&state, &mut cursor).await {
                 tracing::debug!("gateway activity scan: {e:#}");
             }
-            since = now;
             if let Err(e) = stop_idle(&state).await {
                 tracing::warn!("idle stop: {e:#}");
             }
@@ -70,8 +65,9 @@ pub fn spawn(state: Arc<AppState>) {
 }
 
 /// Count requests per instance from the gateway's access log since `since`.
-async fn scan_gateway(state: &AppState, since: i64) -> anyhow::Result<()> {
-    if !crate::gateway::is_running(state).await.unwrap_or(false) {
+async fn scan_gateway(state: &AppState, cursor: &mut LogCursor) -> anyhow::Result<()> {
+    let requested = cursor.new_hosts().await;
+    if requested.is_empty() {
         return Ok(());
     }
     let hosts: HashMap<String, (String, String)> = {
@@ -91,15 +87,19 @@ async fn scan_gateway(state: &AppState, since: i64) -> anyhow::Result<()> {
     if hosts.is_empty() {
         return Ok(());
     }
-    let seen = requested_hosts(state, since, &hosts).await?;
-    for (p, i) in seen {
+    for (p, i) in owners(&requested, &hosts) {
         touch(&p, &i).await;
     }
     Ok(())
 }
 
 /// Start sleeping instances whose URL was requested since `since`.
-async fn wake_requested(state: &Arc<AppState>, since: i64) -> anyhow::Result<()> {
+async fn wake_requested(state: &Arc<AppState>, cursor: &mut LogCursor) -> anyhow::Result<()> {
+    // Always advance, so requests seen while nothing sleeps never wake anything later.
+    let requested = cursor.new_hosts().await;
+    if requested.is_empty() {
+        return Ok(());
+    }
     let sleeping: HashMap<String, (String, String)> = {
         let cfg = state.config.lock().await;
         cfg.gateway
@@ -113,10 +113,7 @@ async fn wake_requested(state: &Arc<AppState>, since: i64) -> anyhow::Result<()>
             })
             .collect()
     };
-    if sleeping.is_empty() || !crate::gateway::is_running(state).await.unwrap_or(false) {
-        return Ok(());
-    }
-    for (project, instance) in requested_hosts(state, since, &sleeping).await? {
+    for (project, instance) in owners(&requested, &sleeping) {
         if jobs::running_for(&project, &instance).await.is_some() {
             continue;
         }
@@ -134,40 +131,67 @@ async fn wake_requested(state: &Arc<AppState>, since: i64) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Instances (from `hosts`) with gateway requests since `since`.
-async fn requested_hosts(
-    state: &AppState,
-    since: i64,
-    hosts: &HashMap<String, (String, String)>,
-) -> anyhow::Result<std::collections::HashSet<(String, String)>> {
-    let rt = state.rt().await;
-    let mut stream = rt.docker.logs(
-        "orca-gateway",
-        Some(bollard::container::LogsOptions::<String> {
-            stdout: true,
-            stderr: true,
-            since,
-            ..Default::default()
-        }),
-    );
-    let mut seen = std::collections::HashSet::new();
-    while let Some(Ok(chunk)) = stream.next().await {
-        let line = chunk.to_string();
-        if !line.contains("handled request") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
+fn owners(requested: &HashSet<String>, hosts: &HashMap<String, (String, String)>) -> HashSet<(String, String)> {
+    requested.iter().filter_map(|h| hosts.get(h).cloned()).collect()
+}
+
+/// Reads the gateway access log incrementally: each call returns the hosts
+/// requested since the previous one. Starts at the end of the file, and from
+/// the top again when Caddy rolls it over.
+#[derive(Default)]
+struct LogCursor {
+    offset: Option<u64>,
+}
+
+/// Most bytes read per call; a burst beyond this is picked up next time.
+const MAX_READ: u64 = 4 * 1024 * 1024;
+
+impl LogCursor {
+    async fn new_hosts(&mut self) -> HashSet<String> {
+        let path = crate::gateway::access_log_path();
+        let Ok(len) = tokio::fs::metadata(&path).await.map(|m| m.len()) else {
+            // No log yet: whatever appears later is new.
+            self.offset = Some(0);
+            return HashSet::new();
         };
-        let Some(host) = v.pointer("/request/host").and_then(|h| h.as_str()) else {
-            continue;
+        let start = match self.offset {
+            None => len,
+            Some(o) if o <= len => o,
+            Some(_) => 0, // rolled over
         };
-        let host = host.split(':').next().unwrap_or(host);
-        if let Some(owner) = hosts.get(host) {
-            seen.insert(owner.clone());
+        if start == len {
+            self.offset = Some(len);
+            return HashSet::new();
         }
+        let Ok(bytes) = read_range(&path, start, (len - start).min(MAX_READ)).await else {
+            return HashSet::new();
+        };
+        // Only whole lines; a half-written last line waits for the next call.
+        let used = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        self.offset = Some(start + used as u64);
+        hosts_in(&bytes[..used])
     }
-    Ok(seen)
+}
+
+async fn read_range(path: &std::path::Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path).await?;
+    f.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut buf = Vec::with_capacity(len as usize);
+    f.take(len).read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Request hosts (without port) in Caddy JSON access-log lines.
+fn hosts_in(bytes: &[u8]) -> HashSet<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            let host = v.pointer("/request/host")?.as_str()?;
+            Some(host.split(':').next().unwrap_or(host).to_string())
+        })
+        .collect()
 }
 
 async fn stop_idle(state: &Arc<AppState>) -> anyhow::Result<()> {
@@ -227,4 +251,24 @@ async fn stop_idle(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_from_access_lines() {
+        let log = concat!(
+            r#"{"level":"info","logger":"http.log.access","request":{"host":"web-a-shop.localhost:8443"}}"#,
+            "\n",
+            "not json\n",
+            r#"{"request":{"host":"api-a-shop.localhost"}}"#,
+            "\n"
+        );
+        let hosts = hosts_in(log.as_bytes());
+        assert!(hosts.contains("web-a-shop.localhost"));
+        assert!(hosts.contains("api-a-shop.localhost"));
+        assert_eq!(hosts.len(), 2);
+    }
 }
