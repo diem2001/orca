@@ -2009,25 +2009,29 @@ pub async fn check_environment() -> EnvironmentStatus {
                         )),
                     });
                 }
-                if let Some((vm, _)) = find_lima_vm_for_repair().await
-                    && let Some(engine) = lima_engine_needing_update(&vm).await
+                // Only Orca's Lima VM on macOS has a fix (an in-VM apt update).
+                #[cfg(target_os = "macos")]
                 {
-                    let (a, b, c) = ROOTLESS_LEAK_FIXED_IN;
-                    checks.push(HealthCheck {
-                        name: "Docker Engine Update".to_string(),
-                        description: format!(
-                            "Docker Engine {engine} in the Docker VM leaks memory until the VM \
-                             runs out and Docker is killed (fixed in {a}.{b}.{c}). Update to the \
-                             latest Docker Engine."
-                        ),
-                        status: CheckStatus::Warning,
-                        fix_action: Some("update_docker_engine".to_string()),
-                        details: Some(format!(
-                            "Updates Docker inside VM '{vm}' and restarts it. Running containers \
-                             stop for a moment and are started again; containers, images and \
-                             volumes are kept."
-                        )),
-                    });
+                    if let Some((vm, _)) = find_lima_vm_for_repair().await
+                        && let Some(engine) = lima_engine_needing_update(&vm).await
+                    {
+                        let (a, b, c) = ROOTLESS_LEAK_FIXED_IN;
+                        checks.push(HealthCheck {
+                            name: "Docker Engine Update".to_string(),
+                            description: format!(
+                                "Docker Engine {engine} in the Docker VM leaks memory until the VM \
+                                 runs out and Docker is killed (fixed in {a}.{b}.{c}). Update to the \
+                                 latest Docker Engine."
+                            ),
+                            status: CheckStatus::Warning,
+                            fix_action: Some("update_docker_engine".to_string()),
+                            details: Some(format!(
+                                "Updates Docker inside VM '{vm}' and restarts it. Running containers \
+                                 stop for a moment and are started again; containers, images and \
+                                 volumes are kept."
+                            )),
+                        });
+                    }
                 }
             } else {
                 // Distinguish "Lima VM exists but not running" (offer Repair)
