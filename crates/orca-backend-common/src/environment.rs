@@ -2956,24 +2956,15 @@ pub async fn get_system_resources() -> Option<SystemResources> {
     })
 }
 
-/// Full system health check.
+/// Full system health check. The engine version (`docker_version`, `os`,
+/// `arch`) is left for the caller to fill from its runtime connection, which
+/// caches it: every `GET /version` leaks memory in rootless dockerd (see
+/// `BollardRuntime::server_version`), and this check is polled.
 pub async fn check_system_health() -> SystemHealth {
     let connected = check_docker_connection().await;
 
     let cli = detect_cli().await;
-    let version = if connected {
-        // Try CLI first, then fall back to docker version without format (macOS compat)
-        run_cmd(cli, &["version", "--format", "{{.Server.Version}}"])
-            .await
-            .ok()
-            .or({
-                // On macOS, the CLI might not be in PATH even though docker is running.
-                // Try to extract version from the socket connection later (via bollard in daemon).
-                None
-            })
-    } else {
-        None
-    };
+    let version: Option<String> = None;
 
     let disk = if connected { get_disk_usage().await } else { None };
 

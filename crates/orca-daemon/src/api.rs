@@ -4377,14 +4377,24 @@ async fn stop_docker_desktop() -> Result<impl IntoResponse, ApiError> {
 // --- System Health ---
 
 async fn system_health(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(system_health_report(&state).await))
+}
+
+/// Health as the GUI and agents see it. Polled every few seconds, so it
+/// checks the connection with `/_ping` and takes the version from the
+/// runtime's cache: each `GET /version` leaks memory in rootless dockerd.
+pub(crate) async fn system_health_report(state: &AppState) -> orca_core::environment::SystemHealth {
     let mut health = orca_backend_common::environment::check_system_health().await;
 
     // Check the daemon's ACTUAL Docker connection (what the app uses)
-    if let Ok(version) = state.rt().await.docker.version().await {
+    let rt = state.rt().await;
+    if rt.docker.ping().await.is_ok() {
         health.docker_connected = true;
-        health.docker_version = version.version;
-        health.os = version.os;
-        health.arch = version.arch;
+        if let Ok(version) = rt.server_version().await {
+            health.docker_version = version.version;
+            health.os = version.os;
+            health.arch = version.arch;
+        }
         health
             .warnings
             .retain(|w| !w.contains("not running") && !w.contains("not reachable") && !w.contains("Restart"));
@@ -4408,7 +4418,7 @@ async fn system_health(State(state): State<Arc<AppState>>) -> Result<impl IntoRe
         }
     }
 
-    Ok(Json(health))
+    health
 }
 
 /// Returns the host UID:GID so the frontend can offer "Run as host user" for bind mounts.
@@ -4464,9 +4474,11 @@ fn nix_gid() -> u32 {
 async fn try_docker_connection() -> Option<(String, &'static str)> {
     // Try local defaults (Unix socket on Linux/macOS, named pipe on Windows)
     if let Ok(docker) = bollard::Docker::connect_with_local_defaults()
-        && let Ok(ver) = docker.version().await
+        && docker.ping().await.is_ok()
     {
-        return Some((ver.version.unwrap_or_default(), "local"));
+        // Version only for display; this runs on every health poll while
+        // disconnected, so don't ask /version (it leaks in rootless dockerd).
+        return Some((String::new(), "local"));
     }
 
     // On Windows, try TCP to WSL Docker

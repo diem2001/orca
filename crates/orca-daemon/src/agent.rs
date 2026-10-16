@@ -277,7 +277,7 @@ pub async fn execute_tool(
         }
 
         "system_health" => {
-            let health = orca_backend_common::environment::check_system_health().await;
+            let health = crate::api::system_health_report(state).await;
             Ok(serde_json::to_value(health).unwrap_or_default())
         }
 
