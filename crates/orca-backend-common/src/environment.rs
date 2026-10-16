@@ -154,6 +154,46 @@ const ORCA_SME_MASK_SCRIPT: &str = "if grep -qw sme /proc/cpuinfo && [ ! -f /etc
 /// networkd **only when the on-disk content changed** (so it's a no-op in steady
 /// state, and re-applies automatically after a config change ships). Shared by
 /// create-time provisioning and the daemon self-heal so the two can't drift.
+/// First Docker Engine release without the rootless `/version` leak: before
+/// it, every `GET /version` left a connection to rootlesskit's API socket open
+/// inside dockerd (~50 KB each) until the VM ran out of memory (moby
+/// 96c900310).
+pub const ROOTLESS_LEAK_FIXED_IN: (u32, u32, u32) = (29, 9, 1);
+
+/// Whether Docker Engine `version` (as `/version` or `docker info` reports it,
+/// e.g. "29.5.3") has the rootless `/version` leak. Unparseable: no.
+pub fn engine_has_rootless_leak(version: &str) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split(['.', '-', '+']);
+    let mut next = || parts.next().and_then(|p| p.parse::<u32>().ok());
+    match (next(), next(), next()) {
+        (Some(a), Some(b), c) => (a, b, c.unwrap_or(0)) < ROOTLESS_LEAK_FIXED_IN,
+        _ => false,
+    }
+}
+
+/// Docker Engine version inside Orca's Lima VM when it is rootless and has the
+/// `/version` leak, i.e. when the "Update Docker Engine" fix applies. Uses
+/// `docker info`, which doesn't hit `/version`.
+#[cfg(target_os = "macos")]
+async fn lima_engine_needing_update(vm: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let host = format!("unix://{home}/.lima/{vm}/sock/docker.sock");
+    let out = run_cmd(
+        "docker",
+        &[
+            "-H",
+            &host,
+            "info",
+            "--format",
+            "{{.ServerVersion}}|{{json .SecurityOptions}}",
+        ],
+    )
+    .await
+    .ok()?;
+    let (version, security) = out.trim().split_once('|')?;
+    (security.contains("name=rootless") && engine_has_rootless_leak(version)).then(|| version.to_string())
+}
+
 pub fn orca_static_usernet_script() -> String {
     format!(
         "F={path}\nT=$(mktemp)\ncat > $T <<'ORCA_NET_EOF'\n{content}ORCA_NET_EOF\nif ! cmp -s $T $F; then\n  install -m 0644 $T $F\n  systemctl enable systemd-networkd >/dev/null 2>&1 || true\n  systemctl restart systemd-networkd >/dev/null 2>&1 || true\nfi\nrm -f $T\n",
@@ -1206,6 +1246,109 @@ pub async fn run_fix_streaming(action: &str, tx: tokio::sync::mpsc::Sender<Strin
             // `send` closure's borrow of it isn't moved out.
             return Box::pin(run_fix_streaming("setup_docker_macos", tx.clone())).await;
         }
+        #[cfg(target_os = "macos")]
+        "update_docker_engine" => {
+            let Some((vm, status)) = find_lima_vm_for_repair().await else {
+                send("    No Docker VM found.\n".into()).await;
+                anyhow::bail!("No Lima VM to update");
+            };
+            if status != "Running" {
+                send(format!("    VM '{vm}' is {status}. Start it (or Repair it) first.\n")).await;
+                anyhow::bail!("VM '{vm}' is not running");
+            }
+            let home = std::env::var("HOME").unwrap_or_default();
+            let host = format!("unix://{home}/.lima/{vm}/sock/docker.sock");
+            let docker = |args: &[&str]| {
+                let mut all: Vec<String> = vec!["-H".into(), host.clone()];
+                all.extend(args.iter().map(|a| a.to_string()));
+                all
+            };
+            let run_docker = |args: Vec<String>| async move {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                run_cmd("docker", &refs).await
+            };
+
+            send(format!(
+                ">>> Step 1/4: Noting which containers are running in VM '{vm}'\n"
+            ))
+            .await;
+            let running: Vec<String> = run_docker(docker(&["ps", "-q", "--no-trunc"]))
+                .await
+                .map(|o| {
+                    o.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            send(format!(
+                "    {} running; they'll be started again afterwards.\n",
+                running.len()
+            ))
+            .await;
+
+            send(">>> Step 2/4: Updating Docker Engine packages\n".into()).await;
+            let script = "set -e; export DEBIAN_FRONTEND=noninteractive; \
+                apt-get update -q; \
+                apt-get install -y -q --only-upgrade -o Dpkg::Options::=--force-confold \
+                  docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io \
+                  docker-buildx-plugin docker-compose-plugin";
+            if let Err(e) = run_cmd_streaming("limactl", &["shell", &vm, "--", "sudo", "sh", "-c", script], &tx).await {
+                send(format!("\n    Updating failed: {e}\n    Docker was not restarted.\n")).await;
+                anyhow::bail!("apt upgrade failed: {e}");
+            }
+
+            send(">>> Step 3/4: Restarting Docker\n".into()).await;
+            if let Err(e) = run_cmd(
+                "limactl",
+                &["shell", &vm, "--", "systemctl", "--user", "restart", "docker"],
+            )
+            .await
+            {
+                send(format!("    Restart failed: {e}\n")).await;
+                anyhow::bail!("restarting rootless dockerd failed: {e}");
+            }
+            let mut version = None;
+            for _ in 0..30 {
+                if let Ok(v) = run_docker(docker(&["info", "--format", "{{.ServerVersion}}"])).await {
+                    version = Some(v.trim().to_string());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let Some(version) = version else {
+                send("    Docker did not come back within 30 s. Try Repair.\n".into()).await;
+                anyhow::bail!("Docker did not come back after the update");
+            };
+            send(format!("    Docker Engine {version} is running.\n")).await;
+
+            send(">>> Step 4/4: Starting the containers that were running\n".into()).await;
+            let now_running: Vec<String> = run_docker(docker(&["ps", "-q", "--no-trunc"]))
+                .await
+                .map(|o| o.lines().map(|l| l.trim().to_string()).collect())
+                .unwrap_or_default();
+            let mut failed = 0;
+            for id in running.iter().filter(|id| !now_running.contains(id)) {
+                if let Err(e) = run_docker(docker(&["start", id])).await {
+                    failed += 1;
+                    send(format!("    {}: {e}\n", &id[..12.min(id.len())])).await;
+                }
+            }
+            if failed > 0 {
+                send(format!("    {failed} container(s) could not be started; see above.\n")).await;
+            } else {
+                send(format!("    All {} containers are running again.\n", running.len())).await;
+            }
+            if engine_has_rootless_leak(&version) {
+                let (a, b, c) = ROOTLESS_LEAK_FIXED_IN;
+                send(format!(
+                    "\n    The newest Docker Engine available for this VM is {version}, older than \
+                     {a}.{b}.{c}; the leak isn't fixed yet. Try again once a newer release is out.\n"
+                ))
+                .await;
+            }
+        }
         // For all other actions, fall back to non-streaming run_fix
         _ => {
             send(format!("Running {action}...")).await;
@@ -1863,6 +2006,26 @@ pub async fn check_environment() -> EnvironmentStatus {
                         details: Some(format!(
                             "Rebuilds VM '{vm}' on Ubuntu 26.04 + vsock SSH. Containers, images, \
                              and volumes inside it are NOT preserved — you'll re-pull/re-run them."
+                        )),
+                    });
+                }
+                if let Some((vm, _)) = find_lima_vm_for_repair().await
+                    && let Some(engine) = lima_engine_needing_update(&vm).await
+                {
+                    let (a, b, c) = ROOTLESS_LEAK_FIXED_IN;
+                    checks.push(HealthCheck {
+                        name: "Docker Engine Update".to_string(),
+                        description: format!(
+                            "Docker Engine {engine} in the Docker VM leaks memory until the VM \
+                             runs out and Docker is killed (fixed in {a}.{b}.{c}). Update to the \
+                             latest Docker Engine."
+                        ),
+                        status: CheckStatus::Warning,
+                        fix_action: Some("update_docker_engine".to_string()),
+                        details: Some(format!(
+                            "Updates Docker inside VM '{vm}' and restarts it. Running containers \
+                             stop for a moment and are started again; containers, images and \
+                             volumes are kept."
                         )),
                     });
                 }
@@ -2671,6 +2834,24 @@ pub async fn run_fix(action: &str) -> anyhow::Result<String> {
             // Delegate to setup, which recreates when no instance is present.
             Box::pin(run_fix("setup_docker_macos")).await
         }
+        #[cfg(target_os = "macos")]
+        "update_docker_engine" => {
+            // Same steps as the streaming path, with the output collected.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
+            let collect = async move {
+                let mut output = String::new();
+                while let Some(line) = rx.recv().await {
+                    output.push_str(&line);
+                    if !line.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+                output
+            };
+            let (run, output) = tokio::join!(Box::pin(run_fix_streaming("update_docker_engine", tx)), collect);
+            run?;
+            Ok(output)
+        }
         _ => anyhow::bail!("Unknown fix action: {action}"),
     }
 }
@@ -3049,6 +3230,18 @@ async fn get_gpu_info() -> Option<GpuInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rootless_leak_versions() {
+        for leaky in ["29.5.3", "29.6.1", "29.9.0", "28.5.2", "v29.8.10"] {
+            assert!(engine_has_rootless_leak(leaky), "{leaky}");
+        }
+        for fixed in ["29.9.1", "29.10.0", "30.0", "30.0.0-rc.1"] {
+            assert!(!engine_has_rootless_leak(fixed), "{fixed}");
+        }
+        assert!(!engine_has_rootless_leak(""));
+        assert!(!engine_has_rootless_leak("dev"));
+    }
 
     #[test]
     fn extended_path_includes_homebrew() {

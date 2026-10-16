@@ -65,6 +65,11 @@ impl BollardRuntime {
         Ok(v)
     }
 
+    /// Drop the cached version, e.g. after the engine was updated.
+    pub async fn forget_version(&self) {
+        *self.version.lock().await = None;
+    }
+
     /// Detect whether we're talking to Docker or Podman.
     pub async fn detect_runtime(&self) -> orca_core::runtime::RuntimeKind {
         if let Ok(version) = self.server_version().await

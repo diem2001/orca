@@ -4308,16 +4308,19 @@ struct FixRequest {
 }
 
 async fn env_fix(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<FixRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     tracing::info!("env_fix: action={}", body.action);
-    let output = orca_backend_common::environment::run_fix(&body.action).await?;
+    let output = orca_backend_common::environment::run_fix(&body.action).await;
+    // A fix may have restarted or updated the engine.
+    state.rt().await.forget_version().await;
+    let output = output?;
     tracing::info!("env_fix: completed, output_len={}", output.len());
     Ok(Json(serde_json::json!({ "output": output })))
 }
 
-async fn env_fix_stream(Json(body): Json<FixRequest>) -> impl IntoResponse {
+async fn env_fix_stream(State(state): State<Arc<AppState>>, Json(body): Json<FixRequest>) -> impl IntoResponse {
     tracing::info!("env_fix_stream: action={}", body.action);
     use axum::response::sse::{Event, Sse};
     use futures::StreamExt;
@@ -4331,7 +4334,12 @@ async fn env_fix_stream(Json(body): Json<FixRequest>) -> impl IntoResponse {
         // If the SSE client disconnects, `tx.closed()` resolves and we
         // abort the long-running fix instead of running to completion
         // with nobody listening.
-        let fix_fut = orca_backend_common::environment::run_fix_streaming(&action, tx.clone());
+        let fix_fut = async {
+            let res = orca_backend_common::environment::run_fix_streaming(&action, tx.clone()).await;
+            // A fix may have restarted or updated the engine.
+            state.rt().await.forget_version().await;
+            res
+        };
         tokio::select! {
             res = fix_fut => match res {
                 Ok(_) => {
@@ -4391,6 +4399,20 @@ pub(crate) async fn system_health_report(state: &AppState) -> orca_core::environ
     if rt.docker.ping().await.is_ok() {
         health.docker_connected = true;
         if let Ok(version) = rt.server_version().await {
+            let rootless = version
+                .components
+                .iter()
+                .flatten()
+                .any(|c| c.name.eq_ignore_ascii_case("rootlesskit"));
+            if rootless
+                && let Some(v) = version.version.as_deref()
+                && orca_backend_common::environment::engine_has_rootless_leak(v)
+            {
+                let (a, b, c) = orca_backend_common::environment::ROOTLESS_LEAK_FIXED_IN;
+                health.warnings.push(format!(
+                    "Docker Engine {v} leaks memory (fixed in {a}.{b}.{c}). Update it on the System Health page."
+                ));
+            }
             health.docker_version = version.version;
             health.os = version.os;
             health.arch = version.arch;

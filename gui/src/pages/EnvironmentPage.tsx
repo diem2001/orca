@@ -5,7 +5,7 @@ import type { EnvironmentStatus, HealthCheck, MachineInfo, SystemHealth, DockerD
 import { useRefresh } from "../lib/useRefresh";
 import { formatBytes } from "../lib/format";
 import { showToast } from "../components/Toast";
-import { confirmDanger } from "../components/ConfirmDialog";
+import { confirm, confirmDanger } from "../components/ConfirmDialog";
 import { logError } from "../lib/activityStore";
 
 export default function EnvironmentPage() {
@@ -87,6 +87,16 @@ export default function EnvironmentPage() {
           "Ubuntu 26.04 with vsock networking. Containers, images, and volumes " +
           "inside it will be lost — you'll re-pull and re-run them.",
         confirmLabel: "Recreate VM",
+      });
+      if (!ok) return;
+    }
+    if (action === "update_docker_engine") {
+      const ok = await confirm({
+        title: "Update Docker Engine?",
+        message:
+          "Docker restarts inside the VM. Running containers stop for a moment " +
+          "and are started again. Containers, images and volumes are kept.",
+        confirmLabel: "Update",
       });
       if (!ok) return;
     }
@@ -551,7 +561,7 @@ export default function EnvironmentPage() {
                             <button class="btn btn-sm" style={{ "font-size": "11px", padding: "2px 8px" }}
                               disabled={actionRunning()}
                               onClick={() => runFix(check.fix_action!, check.name)}
-                            >Fix</button>
+                            >{check.fix_action === "update_docker_engine" ? "Update" : "Fix"}</button>
                           </Show>
                         </div>
                         <div style={{ "font-size": "12px", color: "#8b949e", "margin-top": "3px", "line-height": "1.4" }}>
