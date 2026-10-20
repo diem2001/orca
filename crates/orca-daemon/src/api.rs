@@ -1006,7 +1006,9 @@ async fn remove_image(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    ImageManager::remove(state.rt().await.as_ref(), &id, false).await?;
+    let rt = state.rt().await;
+    ImageManager::remove(rt.as_ref(), &id, false).await?;
+    rt.forget_disk().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1763,7 +1765,9 @@ async fn compare_builds(Json(req): Json<CompareBuildsRequest>) -> Result<impl In
 }
 
 async fn prune_images(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let result = ImageManager::prune(state.rt().await.as_ref()).await?;
+    let rt = state.rt().await;
+    let result = ImageManager::prune(rt.as_ref()).await?;
+    rt.forget_disk().await;
     Ok(Json(result))
 }
 
@@ -1781,11 +1785,15 @@ async fn batch_delete_images(
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
 
+    let rt = state.rt().await;
     for id in &body.ids {
-        match ImageManager::remove(state.rt().await.as_ref(), id, body.force).await {
+        match ImageManager::remove(rt.as_ref(), id, body.force).await {
             Ok(()) => deleted.push(id.clone()),
             Err(e) => errors.push(format!("{}: {e}", &id[..12.min(id.len())])),
         }
+    }
+    if !deleted.is_empty() {
+        rt.forget_disk().await;
     }
 
     Ok(Json(serde_json::json!({
@@ -3446,7 +3454,9 @@ async fn compose_down(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (dir, config) = resolve_stack_dir(&state, &name).await?;
-    let output = state.rt().await.compose_down(&dir, config.as_deref()).await?;
+    let rt = state.rt().await;
+    let output = rt.compose_down(&dir, config.as_deref()).await?;
+    rt.forget_disk().await;
     Ok(Json(output))
 }
 
@@ -4384,20 +4394,38 @@ async fn stop_docker_desktop() -> Result<impl IntoResponse, ApiError> {
 
 // --- System Health ---
 
-async fn system_health(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(system_health_report(&state).await))
+#[derive(Deserialize)]
+struct HealthQuery {
+    /// `1` or `true` recomputes the engine's disk usage instead of reusing the cached figures.
+    refresh: Option<String>,
+}
+
+async fn system_health(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HealthQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let refresh = matches!(q.refresh.as_deref(), Some("1" | "true"));
+    Ok(Json(system_health_report(&state, refresh).await))
 }
 
 /// Health as the GUI and agents see it. Polled every few seconds, so it
-/// checks the connection with `/_ping` and takes the version from the
-/// runtime's cache: each `GET /version` leaks memory in rootless dockerd.
-pub(crate) async fn system_health_report(state: &AppState) -> orca_core::environment::SystemHealth {
-    let mut health = orca_backend_common::environment::check_system_health().await;
-
-    // Check the daemon's ACTUAL Docker connection (what the app uses)
+/// checks the connection with `/_ping`, takes the version from the runtime's
+/// cache (each `GET /version` leaks memory in rootless dockerd) and the disk
+/// usage from the runtime's cache too (`refresh` recomputes it).
+pub(crate) async fn system_health_report(state: &AppState, refresh: bool) -> orca_core::environment::SystemHealth {
     let rt = state.rt().await;
-    if rt.docker.ping().await.is_ok() {
-        health.docker_connected = true;
+    let connected = rt.docker.ping().await.is_ok();
+    let disk = if connected {
+        rt.disk_usage(refresh)
+            .await
+            .inspect_err(|e| tracing::debug!("system/df failed: {e}"))
+            .ok()
+    } else {
+        None
+    };
+    let mut health = orca_backend_common::environment::check_system_health(connected, disk).await;
+
+    if connected {
         if let Ok(version) = rt.server_version().await {
             let rootless = version
                 .components
@@ -7396,6 +7424,7 @@ async fn cleanup(
     if log.is_empty() {
         log.push("Nothing to clean up".to_string());
     }
+    state.rt().await.forget_disk().await;
 
     Ok(Json(serde_json::json!({ "log": log })))
 }

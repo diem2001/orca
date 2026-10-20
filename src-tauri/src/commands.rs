@@ -2438,8 +2438,14 @@ pub async fn k8s_list_port_forwards() -> Result<serde_json::Value, String> {
 // --- System Health ---
 
 #[tauri::command]
-pub async fn system_health() -> Result<serde_json::Value, String> {
-    get_json("/system/health").await
+pub async fn system_health(refresh: Option<bool>) -> Result<serde_json::Value, String> {
+    // The daemon reuses the engine's disk usage for minutes; `refresh` recomputes it.
+    get_json(if refresh == Some(true) {
+        "/system/health?refresh=1"
+    } else {
+        "/system/health"
+    })
+    .await
 }
 
 #[tauri::command]

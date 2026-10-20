@@ -1,7 +1,8 @@
-import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createEffect, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { Container, ContainerStats, Image, ComposeProject, SystemHealth, GatewayStatus, GatewayRoute } from "../lib/types";
 import { useRefresh } from "../lib/useRefresh";
+import { useHealth } from "../lib/healthStore";
 import { devApi } from "../lib/dev";
 import type { DevProject } from "../lib/dev";
 import { formatBytes } from "../lib/format";
@@ -81,10 +82,6 @@ export default function DashboardPage(props: DashboardPageProps) {
       .then((v) => { setStacks(v || []); setStacksState("ready"); })
       .catch((e) => { setStacksError(friendlyError(String(e))); setStacksState("error"); });
 
-    invokeWithTimeout<SystemHealth>("system_health", undefined, 15_000)
-      .then((v) => { setHealth(v); setHealthState("ready"); })
-      .catch((e) => { setHealthError(friendlyError(String(e))); setHealthState("error"); });
-
     invokeWithTimeout<GatewayStatus>("gateway_status")
       .then((v) => {
         setGatewayStatus(v);
@@ -100,6 +97,20 @@ export default function DashboardPage(props: DashboardPageProps) {
   };
 
   useRefresh(fetchAll);
+
+  // Health comes from the app-wide poll, not from the 5-second refresh above.
+  const shared = useHealth();
+  createEffect(() => {
+    const h = shared.health();
+    const e = shared.healthError();
+    if (e) {
+      setHealthError(friendlyError(e));
+      setHealthState("error");
+    } else if (h) {
+      setHealth(h);
+      setHealthState("ready");
+    }
+  });
 
   // Reset page-local state when switching hosts.
   // NOTE: clearAllMetrics() is NOT called here — the metricsStore module

@@ -1,5 +1,4 @@
 use orca_core::environment::*;
-use serde::Deserialize as SerdeDeserialize;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
@@ -2862,147 +2861,67 @@ pub async fn run_fix(action: &str) -> anyhow::Result<String> {
 
 // ==================== System Health ====================
 
-/// Check if Docker/Podman is currently reachable.
-pub async fn check_docker_connection() -> bool {
-    // First try via the extended PATH
-    let cli = detect_cli().await;
-    let mut cmd = Command::new(cli);
-    cmd.args(["info"]).stdout(Stdio::null()).stderr(Stdio::null());
-    let path = extended_path();
-    cmd.env("PATH", &path);
+/// Disk usage from the engine's `GET /system/df`, summed the way the engine
+/// itself sums it for `docker system df` (API 1.52 `ImageUsage` etc.).
+pub fn summarize_disk_usage(df: &bollard::models::SystemDataUsageResponse) -> DiskUsage {
+    let known = |n: i64| u64::try_from(n).unwrap_or(0);
 
-    if cmd.status().await.is_ok_and(|s| s.success()) {
-        return true;
-    }
+    // Images: all layers; the unique part of images no container uses is reclaimable.
+    let images_size = known(df.layers_size.unwrap_or(0));
+    let images_reclaimable: u64 = df
+        .images
+        .iter()
+        .flatten()
+        .filter(|i| i.containers == 0 && i.size >= 0 && i.shared_size >= 0)
+        .map(|i| known(i.size - i.shared_size))
+        .sum();
 
-    // On Windows, try Docker via WSL
-    #[cfg(target_os = "windows")]
-    {
-        if Command::new("wsl")
-            .args(["-u", "root", "--", "docker", "info"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success())
-        {
-            return true;
+    // Containers: writable layers; those of stopped containers are reclaimable.
+    let mut containers_size = 0;
+    let mut containers_reclaimable = 0;
+    for c in df.containers.iter().flatten() {
+        let size = known(c.size_rw.unwrap_or(0));
+        containers_size += size;
+        if !matches!(c.state.as_deref(), Some("running" | "paused" | "restarting")) {
+            containers_reclaimable += size;
         }
     }
 
-    // Fallback: try connecting directly to the Docker socket
-    let sock = std::path::Path::new("/var/run/docker.sock");
-    if sock.exists() {
-        return true;
-    }
-
-    // Check macOS Docker Desktop socket
-    if let Some(home) = dirs::home_dir() {
-        let desktop_sock = home.join(".docker/run/docker.sock");
-        if desktop_sock.exists() {
-            return true;
+    // Volumes: those no container references are reclaimable.
+    let mut volumes_size = 0;
+    let mut volumes_reclaimable = 0;
+    for v in df.volumes.iter().flatten() {
+        let Some(usage) = &v.usage_data else { continue };
+        let size = known(usage.size);
+        volumes_size += size;
+        if usage.ref_count < 1 {
+            volumes_reclaimable += size;
         }
     }
 
-    false
-}
-
-/// JSON shape returned by `docker system df --format '{{json .}}'`.
-#[derive(SerdeDeserialize)]
-#[serde(rename_all = "PascalCase")]
-struct DockerDfRow {
-    #[serde(rename = "Type")]
-    type_name: String,
-    size: String,
-    reclaimable: String,
-}
-
-/// Parse a Docker human-readable size string (e.g. "1.234GB", "45.6kB") into bytes.
-fn parse_docker_size(s: &str) -> u64 {
-    let s = s.trim();
-    // Find where the numeric part ends and the unit begins
-    let (num_str, unit) = match s.find(|c: char| c.is_alphabetic()) {
-        Some(idx) => (&s[..idx], s[idx..].to_uppercase()),
-        None => return s.parse::<u64>().unwrap_or(0),
-    };
-    let num: f64 = num_str.parse().unwrap_or(0.0);
-    let multiplier: f64 = match unit.as_str() {
-        "B" => 1.0,
-        "KB" => 1_000.0,
-        "MB" => 1_000_000.0,
-        "GB" => 1_000_000_000.0,
-        "TB" => 1_000_000_000_000.0,
-        "KIB" => 1_024.0,
-        "MIB" => 1_048_576.0,
-        "GIB" => 1_073_741_824.0,
-        "TIB" => 1_099_511_627_776.0,
-        _ => 1.0,
-    };
-    (num * multiplier) as u64
-}
-
-/// Parse reclaimable string like "1.234GB (45%)" — extract just the size portion.
-fn parse_reclaimable_size(s: &str) -> u64 {
-    // Strip any parenthesized percentage at the end
-    let size_part = if let Some(idx) = s.find('(') {
-        s[..idx].trim()
-    } else {
-        s.trim()
-    };
-    parse_docker_size(size_part)
-}
-
-/// Get Docker/Podman disk usage (system df).
-pub async fn get_disk_usage() -> Option<DiskUsage> {
-    let cli = detect_cli().await;
-    let output = Command::new(cli)
-        .args(["system", "df", "--format", "{{json .}}"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut images_size: u64 = 0;
-    let mut containers_size: u64 = 0;
-    let mut volumes_size: u64 = 0;
-    let mut build_cache_size: u64 = 0;
-    let mut total_reclaimable: u64 = 0;
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(row) = serde_json::from_str::<DockerDfRow>(line) {
-            let size = parse_docker_size(&row.size);
-            let reclaimable = parse_reclaimable_size(&row.reclaimable);
-            match row.type_name.as_str() {
-                "Images" => images_size = size,
-                "Containers" => containers_size = size,
-                "Volumes" | "Local Volumes" => volumes_size = size,
-                "Build Cache" => build_cache_size = size,
-                _ => {}
-            }
-            total_reclaimable += reclaimable;
+    // Build cache: all records; unshared ones not in use are reclaimable.
+    let mut build_cache_size = 0;
+    let mut build_cache_reclaimable = 0;
+    for b in df.build_cache.iter().flatten() {
+        let size = known(b.size.unwrap_or(0));
+        build_cache_size += size;
+        if b.shared != Some(true) && b.in_use != Some(true) {
+            build_cache_reclaimable += size;
         }
     }
 
-    let total = images_size + containers_size + volumes_size + build_cache_size;
-
-    Some(DiskUsage {
+    DiskUsage {
         images_size_bytes: images_size,
         containers_size_bytes: containers_size,
         volumes_size_bytes: volumes_size,
         build_cache_size_bytes: build_cache_size,
-        total_size_bytes: total,
-        reclaimable_bytes: total_reclaimable,
-    })
+        total_size_bytes: images_size + containers_size + volumes_size + build_cache_size,
+        reclaimable_bytes: images_reclaimable + containers_reclaimable + volumes_reclaimable + build_cache_reclaimable,
+        computed_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs()),
+    }
 }
 
 /// Parse a value in kB from /proc/meminfo.
@@ -3141,18 +3060,13 @@ pub async fn get_system_resources() -> Option<SystemResources> {
     })
 }
 
-/// Full system health check. The engine version (`docker_version`, `os`,
-/// `arch`) is left for the caller to fill from its runtime connection, which
-/// caches it: every `GET /version` leaks memory in rootless dockerd (see
-/// `BollardRuntime::server_version`), and this check is polled.
-pub async fn check_system_health() -> SystemHealth {
-    let connected = check_docker_connection().await;
-
+/// System health from the host's side: memory, disk and GPU, plus the
+/// warnings they raise. The caller knows whether the engine is reachable and
+/// passes that in with the engine's (cached) disk usage; it also fills the
+/// engine version (`docker_version`, `os`, `arch`) from its runtime
+/// connection. This check is polled, so it starts no `docker` processes.
+pub async fn check_system_health(connected: bool, disk: Option<DiskUsage>) -> SystemHealth {
     let cli = detect_cli().await;
-    let version: Option<String> = None;
-
-    let disk = if connected { get_disk_usage().await } else { None };
-
     let resources = get_system_resources().await;
 
     let mut warnings = Vec::new();
@@ -3182,7 +3096,7 @@ pub async fn check_system_health() -> SystemHealth {
 
     SystemHealth {
         docker_connected: connected,
-        docker_version: version,
+        docker_version: None,
         disk_usage: disk,
         system_resources: resources,
         warnings,
@@ -3192,7 +3106,25 @@ pub async fn check_system_health() -> SystemHealth {
     }
 }
 
+/// Whether `nvidia-smi` runs here, probed once: health is polled, and most
+/// hosts have no NVIDIA GPU.
+async fn has_nvidia_smi() -> bool {
+    static PROBE: OnceCell<bool> = OnceCell::const_new();
+    *PROBE
+        .get_or_init(|| async {
+            if cfg!(target_os = "windows") {
+                run_cmd("wsl", &["-u", "root", "--", "nvidia-smi", "-L"]).await.is_ok()
+            } else {
+                run_cmd("nvidia-smi", &["-L"]).await.is_ok()
+            }
+        })
+        .await
+}
+
 async fn get_gpu_info() -> Option<GpuInfo> {
+    if !has_nvidia_smi().await {
+        return None;
+    }
     let output = if cfg!(target_os = "windows") {
         run_cmd(
             "wsl",
@@ -3268,19 +3200,106 @@ mod tests {
     }
 
     #[test]
-    fn parse_docker_size_various_units() {
-        assert_eq!(parse_docker_size("0B"), 0);
-        assert_eq!(parse_docker_size("100B"), 100);
-        assert_eq!(parse_docker_size("1KB"), 1_000);
-        assert_eq!(parse_docker_size("1.5MB"), 1_500_000);
-        assert_eq!(parse_docker_size("2GB"), 2_000_000_000);
-        assert_eq!(parse_docker_size("1KIB"), 1_024);
+    fn summarize_disk_usage_matches_docker_system_df() {
+        use bollard::models::*;
+        let df = SystemDataUsageResponse {
+            layers_size: Some(1000),
+            images: Some(vec![
+                // used by a container: not reclaimable
+                ImageSummary {
+                    size: 500,
+                    shared_size: 200,
+                    containers: 1,
+                    ..Default::default()
+                },
+                ImageSummary {
+                    size: 400,
+                    shared_size: 0,
+                    containers: 0,
+                    ..Default::default()
+                },
+                // sizes unknown: not counted
+                ImageSummary {
+                    size: -1,
+                    shared_size: -1,
+                    containers: 0,
+                    ..Default::default()
+                },
+            ]),
+            containers: Some(vec![
+                ContainerSummary {
+                    size_rw: Some(10),
+                    state: Some("running".into()),
+                    ..Default::default()
+                },
+                ContainerSummary {
+                    size_rw: Some(20),
+                    state: Some("exited".into()),
+                    ..Default::default()
+                },
+                ContainerSummary {
+                    size_rw: None,
+                    state: Some("created".into()),
+                    ..Default::default()
+                },
+            ]),
+            volumes: Some(vec![
+                Volume {
+                    usage_data: Some(VolumeUsageData {
+                        size: 100,
+                        ref_count: 1,
+                    }),
+                    ..Default::default()
+                },
+                Volume {
+                    usage_data: Some(VolumeUsageData { size: 50, ref_count: 0 }),
+                    ..Default::default()
+                },
+                Volume {
+                    usage_data: Some(VolumeUsageData { size: -1, ref_count: 0 }),
+                    ..Default::default()
+                },
+                Volume {
+                    usage_data: None,
+                    ..Default::default()
+                },
+            ]),
+            build_cache: Some(vec![
+                BuildCache {
+                    size: Some(7),
+                    in_use: Some(true),
+                    shared: Some(false),
+                    ..Default::default()
+                },
+                BuildCache {
+                    size: Some(5),
+                    in_use: Some(false),
+                    shared: Some(false),
+                    ..Default::default()
+                },
+                BuildCache {
+                    size: Some(9),
+                    in_use: Some(false),
+                    shared: Some(true),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let du = summarize_disk_usage(&df);
+        assert_eq!(du.images_size_bytes, 1000);
+        assert_eq!(du.containers_size_bytes, 30);
+        assert_eq!(du.volumes_size_bytes, 150);
+        assert_eq!(du.build_cache_size_bytes, 21);
+        assert_eq!(du.total_size_bytes, 1201);
+        // unused image 400, stopped container 20, unreferenced volume 50, idle unshared build cache 5
+        assert_eq!(du.reclaimable_bytes, 400 + 20 + 50 + 5);
+        assert!(du.computed_at.is_some());
     }
 
     #[test]
-    fn parse_reclaimable_size_with_percentage() {
-        assert_eq!(parse_reclaimable_size("1.234GB (45%)"), 1_234_000_000);
-        assert_eq!(parse_reclaimable_size("0B"), 0);
+    fn summarize_disk_usage_of_an_empty_engine() {
+        let du = summarize_disk_usage(&Default::default());
+        assert_eq!((du.total_size_bytes, du.reclaimable_bytes), (0, 0));
     }
 
     #[test]

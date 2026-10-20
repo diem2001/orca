@@ -1,27 +1,24 @@
 import { createSignal, onMount, onCleanup, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import type { SystemHealth, ActiveHost } from "../lib/types";
+import type { ActiveHost } from "../lib/types";
 import { showToast } from "./Toast";
 import { confirm } from "./ConfirmDialog";
 import { getOllamaSetupState, getOllamaSetupStatus, isOllamaSetupRunning } from "../lib/ollamaSetup";
+import { useHealth } from "../lib/healthStore";
 
 interface StatusBarProps {
   onNavigate?: (page: string) => void;
 }
 
 export default function StatusBar(props: StatusBarProps) {
-  const [health, setHealth] = createSignal<SystemHealth | null>(null);
+  const { health } = useHealth();
   const [updateAvailable, setUpdateAvailable] = createSignal<{version: string; body?: string} | null>(null);
   const [installing, setInstalling] = createSignal(false);
   const [appVersion, setAppVersion] = createSignal<string | null>(null);
   const [activeHost, setActiveHost] = createSignal<ActiveHost | null>(null);
 
-  const pollHealth = async () => {
-    try {
-      const h = (await invoke("system_health")) as SystemHealth;
-      setHealth(h);
-    } catch { /* daemon not ready */ }
+  const pollActiveHost = async () => {
     try {
       const host = (await invoke("get_active_host")) as ActiveHost;
       setActiveHost(host);
@@ -78,14 +75,14 @@ export default function StatusBar(props: StatusBarProps) {
   };
 
   onMount(() => {
-    pollHealth();
+    pollActiveHost();
     // Check for updates after 5 seconds, then every hour. The initial
     // setTimeout handle must be captured so we can cancel it if the
     // component unmounts before the 5s elapses.
     const t = setTimeout(checkUpdate, 5000);
     const updateInterval = setInterval(checkUpdate, 3600000);
     getVersion().then((v) => { if (!disposed) setAppVersion(v); }).catch(() => {});
-    const interval = setInterval(pollHealth, 15000);
+    const interval = setInterval(pollActiveHost, 15000);
     onCleanup(() => {
       disposed = true;
       clearTimeout(t);
