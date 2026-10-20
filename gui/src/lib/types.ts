@@ -401,6 +401,8 @@ export interface DiskUsage {
   build_cache_size_bytes: number;
   total_size_bytes: number;
   reclaimable_bytes: number;
+  /** When the daemon computed these figures (Unix seconds); they are cached for minutes. */
+  computed_at?: number;
 }
 
 export interface SystemResources {

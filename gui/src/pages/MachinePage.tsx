@@ -1,6 +1,7 @@
-import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
+import { createSignal, onMount, Show, For } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import type { MachineInfo, SystemHealth } from "../lib/types";
+import type { MachineInfo } from "../lib/types";
+import { useHealth, refreshHealth } from "../lib/healthStore";
 import { formatBytes } from "../lib/format";
 import { showToast } from "../components/Toast";
 import { logError } from "../lib/activityStore";
@@ -44,7 +45,8 @@ function UsageBar(props: { used: number; total: number; label: string }) {
 
 export default function MachinePage() {
   const [machine, setMachine] = createSignal<MachineInfo | null>(null);
-  const [health, setHealth] = createSignal<SystemHealth | null>(null);
+  const { health } = useHealth();
+  const [recomputing, setRecomputing] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [pruning, setPruning] = createSignal(false);
 
@@ -58,18 +60,18 @@ export default function MachinePage() {
     }
   };
 
-  const refreshHealth = async () => {
+  // Disk usage is cached by the daemon for minutes; the Refresh button recomputes it.
+  const refresh = async () => {
+    setRecomputing(true);
     try {
-      const h = (await invoke("system_health")) as SystemHealth;
-      setHealth(h);
-    } catch {
-      // Daemon not ready
+      await Promise.all([refreshMachine(), refreshHealth({ recomputeDisk: true })]);
+    } finally {
+      setRecomputing(false);
     }
   };
 
-  const refresh = async () => {
-    await Promise.all([refreshMachine(), refreshHealth()]);
-  };
+  const asOf = (unixSeconds?: number) =>
+    unixSeconds ? new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
 
   const pruneAll = async () => {
     const ok = await confirmDanger({
@@ -91,17 +93,15 @@ export default function MachinePage() {
     }
   };
 
-  onMount(() => {
-    refresh();
-    const interval = setInterval(refreshHealth, 15_000);
-    onCleanup(() => clearInterval(interval));
-  });
+  onMount(refreshMachine);
 
   return (
     <div>
       <div class="page-header">
         <h1 class="page-title">Machine</h1>
-        <button class="btn" onClick={refresh}>Refresh</button>
+        <button class="btn" onClick={refresh} disabled={recomputing()}>
+          {recomputing() ? "Refreshing..." : "Refresh"}
+        </button>
       </div>
 
       <Show when={error()}>
@@ -209,7 +209,12 @@ export default function MachinePage() {
           {(du) => (
             <div class="card">
               <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center", "margin-bottom": "12px" }}>
-                <h3 style={{ "font-size": "14px", color: "#e6edf3" }}>Docker Disk Usage</h3>
+                <h3 style={{ "font-size": "14px", color: "#e6edf3" }}>
+                  Docker Disk Usage
+                  <Show when={asOf(du().computed_at)}>
+                    {(t) => <span style={{ "font-size": "11px", color: "#8b949e", "font-weight": "normal", "margin-left": "8px" }}>as of {t()}</span>}
+                  </Show>
+                </h3>
                 <button
                   class="btn btn-sm"
                   onClick={pruneAll}

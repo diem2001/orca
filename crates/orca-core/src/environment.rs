@@ -65,6 +65,10 @@ pub struct DiskUsage {
     pub build_cache_size_bytes: u64,
     pub total_size_bytes: u64,
     pub reclaimable_bytes: u64,
+    /// When the engine computed these figures (Unix seconds). They are
+    /// cached for several minutes; `GET /system/health?refresh=1` recomputes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,10 +1,11 @@
-import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
+import { createSignal, createEffect, untrack, onMount, onCleanup, Show, For } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { showToast } from "./Toast";
 import { getAlertEvents, getUnreadCount, markAllRead, clearEvents } from "../lib/activityStore";
 import { openAiWindow } from "./AiAssistant";
-import type { SystemHealth, RemoteHost, ActiveHost } from "../lib/types";
+import type { RemoteHost, ActiveHost } from "../lib/types";
 import { closeOnEscape } from "../lib/closeOnEscape";
+import { useHealth } from "../lib/healthStore";
 
 interface TitlebarProps {
   daemonStatus: string;
@@ -65,29 +66,28 @@ export default function Titlebar(props: TitlebarProps) {
     }
   };
 
-  const pollHealth = async () => {
-    try {
-      const health = (await invoke("system_health")) as SystemHealth;
-      const prevConnected = dockerConnected();
-      setDockerConnected(health.docker_connected);
-      setWarningCount(health.warnings.length);
-      setRuntimeInfo(health.docker_version ? `Docker ${health.docker_version}` : null);
-
-      // Detect reconnection
-      if (prevConnected === false && health.docker_connected) {
-        showToast("Docker connection restored", "success");
-      }
-    } catch {
+  const { health, healthError } = useHealth();
+  createEffect(() => {
+    const h = health();
+    if (healthError() || !h) {
       // Daemon not reachable — docker status unknown
       setDockerConnected(null);
       setWarningCount(0);
+      return;
     }
-  };
+    const prevConnected = untrack(dockerConnected);
+    setDockerConnected(h.docker_connected);
+    setWarningCount(h.warnings.length);
+    setRuntimeInfo(h.docker_version ? `Docker ${h.docker_version}` : null);
+
+    // Detect reconnection
+    if (prevConnected === false && h.docker_connected) {
+      showToast("Docker connection restored", "success");
+    }
+  });
 
   onMount(() => {
-    pollHealth();
     loadHosts();
-    const interval = setInterval(pollHealth, 10_000);
 
     // Reload hosts when settings change
     const onRefresh = () => loadHosts();
@@ -112,7 +112,6 @@ export default function Titlebar(props: TitlebarProps) {
     document.addEventListener("mousedown", handleClickOutside);
 
     onCleanup(() => {
-      clearInterval(interval);
       document.removeEventListener("mousedown", handleClickOutside);
     });
   });
