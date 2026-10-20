@@ -215,7 +215,7 @@ curl -fsSL https://orca-desktop.com/install-daemon.sh | sudo sh
 ## Uninstalling
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edvin/orca/main/deploy/uninstall-daemon.sh | sudo sh
+curl -fsSL https://orca-desktop.com/uninstall-daemon.sh | sudo sh
 ```
 
 Or manually:

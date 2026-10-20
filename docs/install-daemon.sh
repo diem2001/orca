@@ -1,5 +1,5 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 # Orca Daemon Installer for Linux
 # Usage: curl -fsSL https://orca-desktop.com/install-daemon.sh | sudo sh
@@ -21,7 +21,7 @@ fi
 . /etc/os-release
 
 # Check for Docker
-if ! command -v docker &>/dev/null; then
+if ! command -v docker >/dev/null 2>&1; then
     echo "Warning: Docker is not installed."
     echo "Install Docker first: curl -fsSL https://get.docker.com | sh"
     echo ""
@@ -29,11 +29,12 @@ fi
 
 # Install via Cloudsmith apt repo
 echo "Adding Orca repository..."
-if ! command -v curl &>/dev/null; then
+if ! command -v curl >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq curl
 fi
 
-curl -1sLf 'https://dl.cloudsmith.io/public/edvin/orca/setup.deb.sh' | bash
+setup=$(curl -1sLf 'https://dl.cloudsmith.io/public/edvin/orca/setup.deb.sh')
+printf '%s\n' "$setup" | bash
 
 echo "Installing orca-daemon..."
 apt-get install -y orca-daemon
