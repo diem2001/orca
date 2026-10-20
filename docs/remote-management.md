@@ -218,7 +218,16 @@ curl -fsSL https://orca-desktop.com/install-daemon.sh | sudo sh
 curl -fsSL https://orca-desktop.com/uninstall-daemon.sh | sudo sh
 ```
 
-Or manually:
+Or manually, if you installed with the script above:
+
+```bash
+sudo apt-get remove orca-daemon
+sudo rm /etc/apt/sources.list.d/edvin-orca.list
+# Optionally remove config:
+# sudo rm -rf /etc/orca
+```
+
+If you installed the standalone binary by hand:
 
 ```bash
 sudo systemctl stop orca-daemon
