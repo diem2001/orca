@@ -2,7 +2,7 @@ import { createSignal, createEffect, onMount, onCleanup, For, Show } from "solid
 import { invoke } from "@tauri-apps/api/core";
 import type { Container, ContainerStats, Image, ComposeProject, SystemHealth, GatewayStatus, GatewayRoute } from "../lib/types";
 import { useRefresh } from "../lib/useRefresh";
-import { useHealth } from "../lib/healthStore";
+import { useHealth, refreshHealth } from "../lib/healthStore";
 import { devApi } from "../lib/dev";
 import type { DevProject } from "../lib/dev";
 import { formatBytes } from "../lib/format";
@@ -96,7 +96,11 @@ export default function DashboardPage(props: DashboardPageProps) {
       .catch(() => { setGatewayStatus(null); setGatewayRoutes([]); });
   };
 
-  useRefresh(fetchAll);
+  // A manual refresh (Ctrl+R) also fetches health now instead of waiting for its poll.
+  useRefresh(() => {
+    fetchAll();
+    refreshHealth();
+  });
 
   // Health comes from the app-wide poll, not from the 5-second refresh above.
   const shared = useHealth();

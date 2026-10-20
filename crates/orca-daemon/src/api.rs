@@ -576,7 +576,9 @@ async fn remove_container(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state.rt().await.remove_container(&id, false).await?;
+    let rt = state.rt().await;
+    rt.remove_container(&id, false).await?;
+    rt.forget_disk();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1008,7 +1010,7 @@ async fn remove_image(
 ) -> Result<impl IntoResponse, ApiError> {
     let rt = state.rt().await;
     ImageManager::remove(rt.as_ref(), &id, false).await?;
-    rt.forget_disk().await;
+    rt.forget_disk();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1767,7 +1769,7 @@ async fn compare_builds(Json(req): Json<CompareBuildsRequest>) -> Result<impl In
 async fn prune_images(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let rt = state.rt().await;
     let result = ImageManager::prune(rt.as_ref()).await?;
-    rt.forget_disk().await;
+    rt.forget_disk();
     Ok(Json(result))
 }
 
@@ -1793,7 +1795,7 @@ async fn batch_delete_images(
         }
     }
     if !deleted.is_empty() {
-        rt.forget_disk().await;
+        rt.forget_disk();
     }
 
     Ok(Json(serde_json::json!({
@@ -1903,7 +1905,9 @@ async fn remove_volume(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    VolumeManager::remove(state.rt().await.as_ref(), &name, false).await?;
+    let rt = state.rt().await;
+    VolumeManager::remove(rt.as_ref(), &name, false).await?;
+    rt.forget_disk();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3456,7 +3460,7 @@ async fn compose_down(
     let (dir, config) = resolve_stack_dir(&state, &name).await?;
     let rt = state.rt().await;
     let output = rt.compose_down(&dir, config.as_deref()).await?;
-    rt.forget_disk().await;
+    rt.forget_disk();
     Ok(Json(output))
 }
 
@@ -4411,17 +4415,20 @@ async fn system_health(
 /// Health as the GUI and agents see it. Polled every few seconds, so it
 /// checks the connection with `/_ping`, takes the version from the runtime's
 /// cache (each `GET /version` leaks memory in rootless dockerd) and the disk
-/// usage from the runtime's cache too (`refresh` recomputes it).
+/// usage from the runtime's cache too, never waiting for it (`refresh`
+/// recomputes it and waits).
 pub(crate) async fn system_health_report(state: &AppState, refresh: bool) -> orca_core::environment::SystemHealth {
     let rt = state.rt().await;
     let connected = rt.docker.ping().await.is_ok();
-    let disk = if connected {
-        rt.disk_usage(refresh)
+    let disk = if !connected {
+        None
+    } else if refresh {
+        rt.disk_usage(true)
             .await
             .inspect_err(|e| tracing::debug!("system/df failed: {e}"))
             .ok()
     } else {
-        None
+        rt.cached_disk_usage()
     };
     let mut health = orca_backend_common::environment::check_system_health(connected, disk).await;
 
@@ -7424,7 +7431,7 @@ async fn cleanup(
     if log.is_empty() {
         log.push("Nothing to clean up".to_string());
     }
-    state.rt().await.forget_disk().await;
+    state.rt().await.forget_disk();
 
     Ok(Json(serde_json::json!({ "log": log })))
 }

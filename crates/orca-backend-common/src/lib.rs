@@ -90,9 +90,25 @@ impl BollardRuntime {
             .await
     }
 
+    /// The cached disk usage however old, without waiting for the engine.
+    /// A missing or stale value is recomputed in the background for later
+    /// callers: health is polled, and `df` can take several seconds.
+    pub fn cached_disk_usage(self: &std::sync::Arc<Self>) -> Option<orca_core::environment::DiskUsage> {
+        let (value, due) = self.disk.peek();
+        if due {
+            let rt = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rt.disk_usage(false).await {
+                    tracing::debug!("system/df failed: {e}");
+                }
+            });
+        }
+        value
+    }
+
     /// Drop the cached disk usage, e.g. after images or volumes were removed.
-    pub async fn forget_disk(&self) {
-        self.disk.forget().await;
+    pub fn forget_disk(&self) {
+        self.disk.forget();
     }
 
     /// Detect whether we're talking to Docker or Podman.
@@ -112,19 +128,26 @@ impl BollardRuntime {
 
 /// A value that is reused for `ttl` and computed by one caller at a time.
 ///
-/// The lock is held across the computation: callers that arrive meanwhile
-/// wait for it and take its result instead of starting their own, including
-/// forced ones, which only recompute a value older than their own request.
+/// Callers of [`get`](Self::get) that arrive during a computation wait for it
+/// and take its result instead of starting their own, including forced ones,
+/// which only recompute a value older than their own request.
+/// [`peek`](Self::peek) reads the last value without waiting.
 struct TtlCache<T> {
     ttl: std::time::Duration,
-    slot: tokio::sync::Mutex<Option<(std::time::Instant, T)>>,
+    /// Held while computing.
+    computing: tokio::sync::Mutex<()>,
+    value: std::sync::Mutex<Option<(std::time::Instant, T)>>,
+    /// Bumped by `forget`, so a computation that started before it isn't kept.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl<T: Clone> TtlCache<T> {
     fn new(ttl: std::time::Duration) -> Self {
         Self {
             ttl,
-            slot: tokio::sync::Mutex::new(None),
+            computing: tokio::sync::Mutex::new(()),
+            value: std::sync::Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -134,20 +157,34 @@ impl<T: Clone> TtlCache<T> {
         Fut: std::future::Future<Output = Result<T, E>>,
     {
         let asked = std::time::Instant::now();
-        let mut slot = self.slot.lock().await;
-        if let Some((at, v)) = slot.as_ref() {
+        let _computing = self.computing.lock().await;
+        if let Some((at, v)) = self.value.lock().unwrap().as_ref() {
             let fresh = if force { *at >= asked } else { at.elapsed() < self.ttl };
             if fresh {
                 return Ok(v.clone());
             }
         }
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let v = compute().await?;
-        *slot = Some((std::time::Instant::now(), v.clone()));
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+            *self.value.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+        }
         Ok(v)
     }
 
-    async fn forget(&self) {
-        *self.slot.lock().await = None;
+    /// The last value however old, and whether it is due for recomputing
+    /// (missing or older than the TTL) with no computation running.
+    fn peek(&self) -> (Option<T>, bool) {
+        let idle = self.computing.try_lock().is_ok();
+        match self.value.lock().unwrap().as_ref() {
+            Some((at, v)) => (Some(v.clone()), idle && at.elapsed() >= self.ttl),
+            None => (None, idle),
+        }
+    }
+
+    fn forget(&self) {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.value.lock().unwrap() = None;
     }
 }
 
@@ -194,8 +231,52 @@ mod tests {
         let cache = TtlCache::new(Duration::from_secs(600));
         let calls = Arc::new(AtomicUsize::new(0));
         cache.get(false, || counting(&calls)).await.unwrap();
-        cache.forget().await;
+        cache.forget();
         assert_eq!(cache.get(false, || counting(&calls)).await, Ok(2));
+    }
+
+    /// A value computed from before a `forget` is returned but not kept.
+    #[tokio::test]
+    async fn forget_during_a_computation_discards_its_result() {
+        let cache = TtlCache::new(Duration::from_secs(600));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let v = cache
+            .get(false, || {
+                cache.forget();
+                counting(&calls)
+            })
+            .await;
+        assert_eq!(v, Ok(1));
+        assert_eq!(cache.peek(), (None, true));
+        assert_eq!(cache.get(false, || counting(&calls)).await, Ok(2));
+    }
+
+    #[tokio::test]
+    async fn peek_returns_stale_values_and_says_they_are_due() {
+        let cache = TtlCache::new(Duration::from_millis(20));
+        assert_eq!(cache.peek(), (None::<usize>, true));
+        cache.get(false, || async { Ok::<_, ()>(1) }).await.unwrap();
+        assert_eq!(cache.peek(), (Some(1), false));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cache.peek(), (Some(1), true));
+    }
+
+    /// While a computation runs, nothing is due: it will refresh the value.
+    #[tokio::test]
+    async fn peek_during_a_computation_is_not_due() {
+        let cache = TtlCache::new(Duration::from_secs(600));
+        let (_, peeked) = tokio::join!(
+            cache.get(false, || async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, ()>(1)
+            }),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cache.peek()
+            },
+        );
+        assert_eq!(peeked, (None, false));
+        assert_eq!(cache.peek(), (Some(1), false));
     }
 
     #[tokio::test]
