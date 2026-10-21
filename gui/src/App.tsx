@@ -173,8 +173,16 @@ export default function App() {
     }
   };
 
+  let dockerConnectedAtStart = false;
   const checkEnvironment = async () => {
     if (environmentChecked()) return;
+    // The daemon already reached Docker, so the environment is fine: skip
+    // the full check (it runs `docker info` and `limactl`) and show the app.
+    // The System Health page still runs it.
+    if (dockerConnectedAtStart) {
+      setEnvironmentChecked(true);
+      return;
+    }
     setStartupStep("Checking environment...");
 
     // Timeout: if env check takes >15s, show the environment page anyway
@@ -470,7 +478,8 @@ export default function App() {
             // caches, so don't do it on every launch.
             try {
               const health = (await invoke("system_health")) as any;
-              if (!health?.docker_connected) await invoke("reconnect_runtime");
+              dockerConnectedAtStart = health?.docker_connected === true;
+              if (!dockerConnectedAtStart) await invoke("reconnect_runtime");
             } catch {}
             setDaemonStatus("running");
             return;

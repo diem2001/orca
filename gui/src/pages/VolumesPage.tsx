@@ -27,22 +27,27 @@ export default function VolumesPage(props: VolumesPageProps) {
   const [deletingName, setDeletingName] = createSignal<string | null>(null);
   const { sortField, sortDir, toggleSort, sortFn } = useSort<Volume>("name");
 
-  const refresh = async () => {
+  // Sizes take a `system df` walk (seconds on a busy engine) unless the
+  // daemon has them cached, so the list doesn't wait for them.
+  const loadSizes = (recompute = false) =>
+    (invoke("volume_sizes", { refresh: recompute }) as Promise<{ sizes: Record<string, number> }>)
+      .then((r) => setVolumeSizes(r?.sizes || {}))
+      .catch(() => {});
+
+  const refresh = async (recompute = false) => {
+    void loadSizes(recompute);
     try {
-      const [result, sizesResult] = await Promise.all([
-        invoke("list_volumes") as Promise<Volume[]>,
-        invoke("volume_sizes") as Promise<{ sizes: Record<string, number> }>,
-      ]);
+      const result = (await invoke("list_volumes")) as Volume[];
       setVolumes(result || []);
-      setVolumeSizes(sizesResult?.sizes || {});
     } catch {
     }
     setLoaded(true);
   };
 
-  useRefresh(refresh);
+  // A manual refresh (Ctrl+R) measures the sizes again.
+  useRefresh(() => refresh(true));
 
-  onMount(refresh);
+  onMount(() => refresh());
 
   const sorted = () => {
     const sizes = volumeSizes();
@@ -102,7 +107,7 @@ export default function VolumesPage(props: VolumesPageProps) {
         </h1>
         <div class="page-actions">
           <button class="btn btn-primary" onClick={() => setShowCreate(true)}>Create</button>
-          <button class="btn" onClick={refresh}>Refresh</button>
+          <button class="btn" onClick={() => refresh(true)}>Refresh</button>
         </div>
       </div>
 

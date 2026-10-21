@@ -3103,25 +3103,20 @@ async fn volume_containers(
 }
 
 /// Return disk usage sizes for all volumes via `docker system df`.
-async fn volume_sizes(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let rt = state.rt().await;
-    let df = rt
-        .docker
-        .df()
+/// Volume sizes, from the cached `system df` walk shared with health (it
+/// sizes every image, container and volume: seconds of engine CPU).
+/// `?refresh=1` walks again.
+async fn volume_sizes(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HealthQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let refresh = matches!(q.refresh.as_deref(), Some("1" | "true"));
+    let sizes = state
+        .rt()
+        .await
+        .volume_sizes(refresh)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get system df: {e}"))?;
-
-    let mut sizes: HashMap<String, i64> = HashMap::new();
-    if let Some(volumes) = df.volumes {
-        for v in volumes {
-            if let Some(usage) = v.usage_data
-                && usage.size >= 0
-            {
-                sizes.insert(v.name, usage.size);
-            }
-        }
-    }
-
     Ok(Json(serde_json::json!({ "sizes": sizes })))
 }
 

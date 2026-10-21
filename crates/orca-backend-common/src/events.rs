@@ -75,7 +75,9 @@ impl BollardRuntime {
                                 if matches!(action, "delete" | "untag") {
                                     disk.forget();
                                 }
-                            } else if typ == Some(EventMessageTypeEnum::VOLUME) && action == "destroy" {
+                            } else if typ == Some(EventMessageTypeEnum::VOLUME)
+                                && matches!(action, "create" | "destroy")
+                            {
                                 disk.forget();
                             }
                             // The type's Debug form is upper case (`CONTAINER`), so

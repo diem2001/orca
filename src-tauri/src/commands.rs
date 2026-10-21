@@ -1133,8 +1133,14 @@ pub async fn volume_containers(name: String) -> Result<serde_json::Value, String
 }
 
 #[tauri::command]
-pub async fn volume_sizes() -> Result<serde_json::Value, String> {
-    get_json("/volumes/sizes").await
+pub async fn volume_sizes(refresh: Option<bool>) -> Result<serde_json::Value, String> {
+    // Sizes come from a cached `system df` walk; `refresh` walks again.
+    get_json(if refresh == Some(true) {
+        "/volumes/sizes?refresh=1"
+    } else {
+        "/volumes/sizes"
+    })
+    .await
 }
 
 // --- Container File Browsing ---

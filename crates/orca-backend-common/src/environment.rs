@@ -2932,6 +2932,31 @@ pub async fn get_system_resources() -> Option<SystemResources> {
     tokio::task::spawn_blocking(system_resources).await.ok()
 }
 
+/// Total and available bytes of the system drive, as `df /` or drive C:
+/// reported them. On Unix one `statvfs` of `/`: listing every disk (as
+/// sysinfo does) took most of a health check's CPU.
+#[cfg(unix)]
+fn system_disk_space() -> (u64, u64) {
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a zeroed struct for the kernel to fill.
+    if unsafe { libc::statvfs(c"/".as_ptr(), &mut st) } != 0 {
+        return (0, 0);
+    }
+    let fragment = st.f_frsize as u64;
+    (st.f_blocks as u64 * fragment, st.f_bavail as u64 * fragment)
+}
+
+#[cfg(not(unix))]
+fn system_disk_space() -> (u64, u64) {
+    let root = std::path::Path::new("C:\\");
+    sysinfo::Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .find(|d| d.mount_point() == root)
+        .map(|d| (d.total_space(), d.available_space()))
+        .unwrap_or((0, 0))
+}
+
 fn system_resources() -> SystemResources {
     let cpu_count = std::thread::available_parallelism()
         .map(|p| p.get() as u32)
@@ -2949,14 +2974,7 @@ fn system_resources() -> SystemResources {
         sys.available_memory()
     };
 
-    // The system drive, as `df /` or drive C: reported it.
-    let root = std::path::Path::new(if cfg!(target_os = "windows") { "C:\\" } else { "/" });
-    let (disk_total, disk_free) = sysinfo::Disks::new_with_refreshed_list()
-        .list()
-        .iter()
-        .find(|d| d.mount_point() == root)
-        .map(|d| (d.total_space(), d.available_space()))
-        .unwrap_or((0, 0));
+    let (disk_total, disk_free) = system_disk_space();
 
     let disk_usage_percent = if disk_total > 0 {
         ((disk_total - disk_free) as f64 / disk_total as f64) * 100.0

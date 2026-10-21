@@ -74,6 +74,7 @@ export default function ProjectsPage(props: Props) {
     return p ? jobs()[jobKey(p.id, inst.name)] ?? null : null;
   };
 
+  let candidatesLoaded = false;
   const refresh = async () => {
     try {
       const list = await devApi.listProjects(true);
@@ -85,7 +86,11 @@ export default function ProjectsPage(props: Props) {
           if (i.job_id && !following.has(i.job_id)) track(p.id, i.name, i.job_id, false);
         }
       }
-      if (list.length === 0) devApi.candidates().then(setCandidates).catch(() => {});
+      // Suggestions run git in every compose folder, so look once, not every poll.
+      if (list.length === 0 && !candidatesLoaded) {
+        candidatesLoaded = true;
+        devApi.candidates().then(setCandidates).catch(() => {});
+      }
     } catch (e) {
       setLoadError(String(e));
       if (projects() === null) setProjects([]);
@@ -93,7 +98,10 @@ export default function ProjectsPage(props: Props) {
   };
 
   usePoller(refresh, 5000);
-  useRefresh(refresh);
+  useRefresh(() => {
+    candidatesLoaded = false;
+    void refresh();
+  });
 
   /** Follow a job, keeping the card's progress live; toast the outcome. */
   const track = async (project: string, instance: string, jobId: string, announce: boolean) => {

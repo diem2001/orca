@@ -50,7 +50,7 @@ pub struct BollardRuntime {
     /// reach the same engine as the API client whatever the CLI context says.
     pub host: Option<String>,
     version: tokio::sync::Mutex<Option<(std::time::Instant, bollard::system::Version)>>,
-    disk: std::sync::Arc<TtlCache<orca_core::environment::DiskUsage>>,
+    disk: std::sync::Arc<TtlCache<DiskSnapshot>>,
     containers: std::sync::Arc<TtlCache<Vec<orca_core::runtime::Container>>>,
     images: std::sync::Arc<TtlCache<Vec<orca_core::image::Image>>>,
     stats: TtlCache<Vec<orca_core::runtime::ContainerStats>>,
@@ -117,10 +117,35 @@ impl BollardRuntime {
     /// `force` recomputes it. Concurrent callers share one computation, so
     /// several pollers or a burst of refreshes cost the engine one walk.
     pub async fn disk_usage(&self, force: bool) -> Result<orca_core::environment::DiskUsage, bollard::errors::Error> {
+        Ok(self.disk_snapshot(force).await?.usage)
+    }
+
+    /// Size of each volume in bytes, from the same `GET /system/df` walk as
+    /// [`disk_usage`](Self::disk_usage) and cached with it.
+    pub async fn volume_sizes(
+        &self,
+        force: bool,
+    ) -> Result<std::collections::HashMap<String, u64>, bollard::errors::Error> {
+        Ok(self.disk_snapshot(force).await?.volume_sizes)
+    }
+
+    async fn disk_snapshot(&self, force: bool) -> Result<DiskSnapshot, bollard::errors::Error> {
         self.disk
             .get(force, || async {
                 let df = self.docker.df().await?;
-                Ok(environment::summarize_disk_usage(&df))
+                let volume_sizes = df
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .filter_map(|v| {
+                        let size = v.usage_data.as_ref()?.size;
+                        Some((v.name.clone(), u64::try_from(size).ok()?))
+                    })
+                    .collect();
+                Ok(DiskSnapshot {
+                    usage: environment::summarize_disk_usage(&df),
+                    volume_sizes,
+                })
             })
             .await
     }
@@ -130,6 +155,7 @@ impl BollardRuntime {
     /// callers: health is polled, and `df` can take several seconds.
     pub fn cached_disk_usage(self: &std::sync::Arc<Self>) -> Option<orca_core::environment::DiskUsage> {
         let (value, due) = self.disk.peek();
+        let value = value.map(|s| s.usage);
         if due {
             let rt = self.clone();
             tokio::spawn(async move {
@@ -170,6 +196,13 @@ impl BollardRuntime {
         }
         orca_core::runtime::RuntimeKind::Docker
     }
+}
+
+/// What one `GET /system/df` walk yields, cached as a whole.
+#[derive(Clone)]
+struct DiskSnapshot {
+    usage: orca_core::environment::DiskUsage,
+    volume_sizes: std::collections::HashMap<String, u64>,
 }
 
 /// A value that is reused for `ttl` and computed by one caller at a time.

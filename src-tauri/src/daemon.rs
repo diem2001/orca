@@ -143,9 +143,10 @@ impl DaemonManager {
 
         *self.child.lock().map_err(|e| format!("Lock poisoned: {e}"))? = Some(child);
 
-        // Wait for daemon to become ready
-        for _ in 0..30 {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Wait for daemon to become ready. It usually is within ~100 ms, so
+        // check often rather than making every launch wait a full 250 ms.
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             if self.health_check().await {
                 tracing::info!("Orca daemon is ready");
                 return Ok(());
