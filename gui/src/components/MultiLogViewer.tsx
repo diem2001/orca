@@ -1,4 +1,6 @@
 import { createSignal, onMount, onCleanup, For, Show, createEffect, createMemo } from "solid-js";
+import VirtualLogList from "./VirtualLogList";
+import { LogBuffer, FilteredView, createFrameBatcher } from "../lib/logBuffer";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { copyToClipboard } from "../lib/clipboard";
@@ -55,7 +57,7 @@ function highlightLine(line: string, regex: RegExp | null): string {
   let m: RegExpExecArray | null;
   while ((m = regex.exec(line)) !== null) {
     if (m.index > last) out += escapeHtml(line.slice(last, m.index));
-    out += `<mark style="background:#d29922;color:#0d1117;border-radius:2px;padding:0 1px">${escapeHtml(m[0])}</mark>`;
+    out += `<mark class="log-hl">${escapeHtml(m[0])}</mark>`;
     last = m.index + m[0].length;
     if (m[0].length === 0) regex.lastIndex++;
   }
@@ -70,7 +72,16 @@ interface LogEntry {
 }
 
 export default function MultiLogViewer(props: MultiLogViewerProps) {
-  const [entries, setEntries] = createSignal<LogEntry[]>([]);
+  // Entries live in a plain capped buffer; `version` is bumped once per
+  // applied batch so dependants re-run without copying the array.
+  const buffer = new LogBuffer<LogEntry>(MAX_ENTRIES);
+  const view = new FilteredView<LogEntry>();
+  const [version, setVersion] = createSignal(0);
+  const bump = () => setVersion((v) => v + 1);
+  const entryCount = () => {
+    version();
+    return buffer.length;
+  };
   const [loading, setLoading] = createSignal(true);
   const [filter, setFilter] = createSignal("");
   const [useRegex, setUseRegex] = createSignal(false);
@@ -88,7 +99,6 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
   // was computed once from the initial prop snapshot, so any later change
   // caused later containers to render without a color.
   const [colorMap, setColorMap] = createSignal<Map<string, string>>(new Map());
-  let logContainer: HTMLDivElement | undefined;
 
   // Module-level for this component instance — flipped synchronously on
   // unmount so any in-flight async callback skips its state writes.
@@ -129,10 +139,30 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
       return filtered;
     });
     // Drop entries from containers that have been removed.
-    setEntries((prev) => prev.filter((e) => idSet.has(e.containerId)));
+    const kept = buffer.toArray().filter((e) => idSet.has(e.containerId));
+    if (kept.length !== buffer.length) {
+      buffer.reset(kept);
+      bump();
+    }
   });
 
   const colorFor = (id: string): string => colorMap().get(id) || COLORS[0];
+
+  // Live lines arrive in batches per container (one event per ~50 ms each);
+  // apply them at most once per frame.
+  const incoming = createFrameBatcher<LogEntry>((raw) => {
+    if (disposed) return;
+    const newItems: LogEntry[] = [];
+    for (const e of raw) {
+      for (const l of e.line.replace(/\r/g, "").split("\n")) {
+        const line = l.trimEnd();
+        if (line.length > 0) newItems.push({ containerId: e.containerId, containerName: e.containerName, line });
+      }
+    }
+    if (newItems.length === 0) return;
+    buffer.push(newItems);
+    bump();
+  }, MAX_ENTRIES);
 
   // Subscribe per-container to the streaming log endpoint and merge incoming
   // lines into a single chronologically-appended store. This replaces the
@@ -144,6 +174,7 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
 
     onCleanup(() => {
       disposed = true;
+      incoming.cancel();
       for (const u of unlistens) {
         try { u(); } catch {}
       }
@@ -153,20 +184,6 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
       }
       subscribedIds.clear();
     });
-
-    const appendLines = (c: { id: string; name: string }, raw: string[]) => {
-      if (disposed) return;
-      const newItems: LogEntry[] = raw
-        .flatMap((l) => l.replace(/\r/g, "").split("\n"))
-        .map((l) => l.trimEnd())
-        .filter((l) => l.length > 0)
-        .map((line) => ({ containerId: c.id, containerName: c.name, line }));
-      if (newItems.length === 0) return;
-      setEntries((prev) => {
-        const combined = prev.concat(newItems);
-        return combined.length > MAX_ENTRIES ? combined.slice(-MAX_ENTRIES) : combined;
-      });
-    };
 
     const resubscribeAll = async () => {
       if (disposed) return;
@@ -202,20 +219,20 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
         }
       });
       // Replace the seed snapshot (we're starting fresh for this containers list).
-      setEntries(
-        allEntries.length > MAX_ENTRIES ? allEntries.slice(-MAX_ENTRIES) : allEntries,
-      );
+      incoming.cancel();
+      buffer.reset(allEntries);
+      bump();
       setLoading(false);
 
       // Attach the event listener once and dispatch by containerId.
       const byId = new Map(list.map((c) => [c.id, c] as const));
-      const unlisten = await listen<{ containerId: string; line: string }>(
-        "container-log-line",
+      const unlisten = await listen<{ containerId: string; lines: string[] }>(
+        "container-log-lines",
         (event) => {
           if (disposed) return;
           const c = byId.get(event.payload.containerId);
           if (!c) return;
-          appendLines(c, [event.payload.line]);
+          incoming.push(event.payload.lines.map((line) => ({ containerId: c.id, containerName: c.name, line })));
         },
       );
       if (disposed) {
@@ -254,7 +271,9 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
   const refreshLogs = async () => {
     if (disposed) return;
     setLoading(true);
-    setEntries([]);
+    incoming.cancel();
+    buffer.reset([]);
+    bump();
     // Re-run the initial tail fetch for all currently-subscribed containers.
     const list = props.containers.slice();
     const results = await Promise.allSettled(
@@ -274,50 +293,45 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
         }
       }
     });
-    setEntries(
-      allEntries.length > MAX_ENTRIES ? allEntries.slice(-MAX_ENTRIES) : allEntries,
-    );
+    buffer.reset(allEntries);
+    bump();
     setLoading(false);
   };
 
-  createEffect(() => {
-    if (autoScroll() && logContainer) {
-      entries();
-      requestAnimationFrame(() => {
-        if (logContainer) {
-          logContainer.scrollTop = logContainer.scrollHeight;
-        }
-      });
-    }
-  });
-
-  const filteredEntries = () => {
+  // Entry predicate: visible container and, if set, the filter matching
+  // the line or the container name (an invalid regex filters nothing).
+  const matcher = createMemo((): ((e: LogEntry) => number) => {
     const visible = visibleContainers();
     const f = filter();
-    let result = entries().filter((e) => visible.has(e.containerId));
+    let regex: RegExp | null = null;
     if (f) {
       try {
         const flags = caseSensitive() ? "" : "i";
-        const regex = useRegex()
-          ? new RegExp(f, flags)
-          : new RegExp(escapeRegex(f), flags);
-        result = result.filter((e) => regex.test(e.line) || regex.test(e.containerName));
+        regex = useRegex() ? new RegExp(f, flags) : new RegExp(escapeRegex(f), flags);
       } catch {
         // Invalid regex
       }
     }
-    return result;
-  };
+    return (e) =>
+      visible.has(e.containerId) && (!regex || regex.test(e.line) || regex.test(e.containerName)) ? 1 : 0;
+  });
+
+  // Seqs of the entries that pass the predicate; while it is unchanged only
+  // newly appended entries are tested.
+  const filteredEntries = createMemo(
+    () => {
+      version();
+      view.update(buffer, matcher());
+      return view.seqs;
+    },
+    undefined,
+    { equals: false },
+  );
 
   const highlightRegex = createMemo(() =>
     compileHighlight(filter(), useRegex(), caseSensitive()),
   );
 
-  const handleScroll = () => {
-    if (!logContainer) return;
-    const { scrollTop, scrollHeight, clientHeight } = logContainer;
-    setAutoScroll(scrollHeight - scrollTop - clientHeight < 50);
-  };
 
   const toggleContainer = (id: string) => {
     const next = new Set(visibleContainers());
@@ -331,7 +345,10 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
 
   const copyAll = () => {
     const text = filteredEntries()
-      .map((e) => `[${e.containerName}] ${e.line}`)
+      .map((seq) => {
+        const e = buffer.at(seq);
+        return `[${e.containerName}] ${e.line}`;
+      })
       .join("\n");
     copyToClipboard(text);
   };
@@ -429,12 +446,7 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
             </div>
             <button
               class={`btn btn-sm ${autoScroll() ? "btn-primary" : ""}`}
-              onClick={() => {
-                setAutoScroll(!autoScroll());
-                if (!autoScroll() && logContainer) {
-                  logContainer.scrollTop = logContainer.scrollHeight;
-                }
-              }}
+              onClick={() => setAutoScroll(!autoScroll())}
               style={{ "font-size": "12px" }}
             >
               Auto-scroll
@@ -504,78 +516,50 @@ export default function MultiLogViewer(props: MultiLogViewerProps) {
 
         {/* Log content */}
         <Show
-          when={!loading() || entries().length > 0}
+          when={!loading() || entryCount() > 0}
           fallback={
             <div style={{ padding: "24px", color: "#8b949e", "text-align": "center" }}>
               Loading logs...
             </div>
           }
         >
-          <div
+          <VirtualLogList
             class="selectable"
-            ref={logContainer}
-            onScroll={handleScroll}
             style={{
               flex: "1",
-              overflow: "auto",
               padding: "8px 0",
-              "font-size": `${fontSize()}px`,
+              "font-family": "'JetBrains Mono NF', monospace",
             }}
-          >
-            <Show when={filteredEntries().length > 0} fallback={
-              <div style={{ padding: "24px", color: "#8b949e", "text-align": "center", "font-family": "'JetBrains Mono NF', monospace" }}>
+            keys={filteredEntries()}
+            textLength={(seq) => buffer.at(seq).line.length}
+            fontSize={fontSize()}
+            lineHeight={1.4}
+            // Row margin + border + padding + name column + its margin.
+            gutter={8 + 3 + 8 + 140 + 8}
+            follow={autoScroll()}
+            onScrolled={setAutoScroll}
+            empty={
+              <div style={{ padding: "24px", color: "#8b949e", "text-align": "center" }}>
                 (no log output)
               </div>
-            }>
-              <For each={filteredEntries()}>
-                {(entry) => {
-                  const entryColor = () => colorFor(entry.containerId);
-                  return (
-                    <div
-                      style={{
-                        display: "flex",
-                        "font-family": "'JetBrains Mono NF', monospace",
-                        "font-size": `${fontSize()}px`,
-                        "line-height": "1.4",
-                        "border-left": `3px solid ${entryColor()}`,
-                        "margin-left": "8px",
-                        "padding-left": "8px",
-                      }}
-                    >
-                      <span
-                        style={{
-                          color: entryColor(),
-                          "min-width": "140px",
-                          "max-width": "140px",
-                          "flex-shrink": "0",
-                          overflow: "hidden",
-                          "text-overflow": "ellipsis",
-                          "white-space": "nowrap",
-                          "margin-right": "8px",
-                          "font-size": "11px",
-                          "padding-top": "1px",
-                        }}
-                        title={entry.containerName}
-                      >
-                        {entry.containerName}
-                      </span>
-                      <span
-                        style={{
-                          "white-space": "pre-wrap",
-                          "word-break": "break-all",
-                          flex: "1",
-                        }}
-                        {...(highlightRegex()
-                          ? { innerHTML: highlightLine(entry.line, highlightRegex()) }
-                          : { textContent: entry.line }
-                        )}
-                      />
-                    </div>
-                  );
-                }}
-              </For>
-            </Show>
-          </div>
+            }
+            renderRow={(seq) => {
+              const entry = buffer.at(seq);
+              const entryColor = () => colorFor(entry.containerId);
+              return (
+                <div class="multi-log-row" style={{ "border-left-color": entryColor() }}>
+                  <span class="multi-log-name" style={{ color: entryColor() }} title={entry.containerName}>
+                    {entry.containerName}
+                  </span>
+                  <span
+                    class="multi-log-text"
+                    // eslint-disable-next-line solid/no-innerhtml -- highlightLine produces pre-escaped HTML with safe <mark> tags
+                    innerHTML={highlightLine(entry.line, highlightRegex())}
+                  />
+                </div>
+              );
+            }}
+          />
         </Show>
       </div>
     </div>

@@ -1417,6 +1417,45 @@ input[type="checkbox"]:checked::after {
   word-break: break-all;
 }
 
+/* Rows of VirtualLogList — font size and line-height are set on the list. */
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-hl {
+  background: #d29922;
+  color: #0d1117;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* MultiLogViewer row: coloured left border, container name, text.
+   The border colour is set per row. */
+.multi-log-row {
+  display: flex;
+  border-left: 3px solid;
+  margin-left: 8px;
+  padding-left: 8px;
+}
+
+.multi-log-name {
+  flex: 0 0 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 8px;
+  font-size: 11px;
+  padding-top: 1px;
+}
+
+.multi-log-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .log-loading {
   padding: 20px;
   text-align: center;

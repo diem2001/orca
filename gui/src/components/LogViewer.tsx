@@ -1,8 +1,10 @@
-import { createSignal, onMount, onCleanup, Show, createEffect, For, createMemo } from "solid-js";
+import { createSignal, onMount, onCleanup, Show, createMemo } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { copyToClipboard } from "../lib/clipboard";
 import Dropdown from "./Dropdown";
+import VirtualLogList from "./VirtualLogList";
+import { LogBuffer, FilteredView, createFrameBatcher } from "../lib/logBuffer";
 
 interface LogViewerProps {
   containerId: string;
@@ -56,7 +58,7 @@ function highlightLine(line: string, regex: RegExp | null): string {
   let m: RegExpExecArray | null;
   while ((m = regex.exec(line)) !== null) {
     if (m.index > last) out += escapeHtml(line.slice(last, m.index));
-    out += `<mark style="background:#d29922;color:#0d1117;border-radius:2px;padding:0 1px">${escapeHtml(m[0])}</mark>`;
+    out += `<mark class="log-hl">${escapeHtml(m[0])}</mark>`;
     last = m.index + m[0].length;
     // Guard against zero-length matches spinning forever.
     if (m[0].length === 0) regex.lastIndex++;
@@ -65,24 +67,17 @@ function highlightLine(line: string, regex: RegExp | null): string {
   return out;
 }
 
-function countMatches(lines: string[], filter: string, isRegex: boolean, caseSensitive: boolean): number {
-  if (!filter) return 0;
-  try {
-    const flags = caseSensitive ? "g" : "gi";
-    const regex = isRegex ? new RegExp(filter, flags) : new RegExp(escapeRegex(filter), flags);
-    let count = 0;
-    for (const line of lines) {
-      const matches = line.match(regex);
-      if (matches) count += matches.length;
-    }
-    return count;
-  } catch {
-    return 0;
-  }
-}
-
 export default function LogViewer(props: LogViewerProps) {
-  const [lines, setLines] = createSignal<string[]>([]);
+  // The lines live in a plain capped buffer; `version` is bumped once per
+  // applied batch so dependants re-run without copying the array.
+  const buffer = new LogBuffer<string>(MAX_LINES);
+  const view = new FilteredView<string>();
+  const [version, setVersion] = createSignal(0);
+  const bump = () => setVersion((v) => v + 1);
+  const lineCount = () => {
+    version();
+    return buffer.length;
+  };
   const [loading, setLoading] = createSignal(true);
   const [autoScroll, setAutoScroll] = createSignal(true);
   const [filter, setFilter] = createSignal("");
@@ -95,7 +90,8 @@ export default function LogViewer(props: LogViewerProps) {
   // While the user has scrolled up, we stop trimming the head of the buffer
   // so their viewport doesn't silently jump to unrelated content. New lines
   // queue in `pendingLines` and are flushed when they re-enable autoscroll.
-  const [pendingLines, setPendingLines] = createSignal<string[]>([]);
+  let pendingLines: string[] = [];
+  const [pendingCount, setPendingCount] = createSignal(0);
   let logContainer: HTMLDivElement | undefined;
   let filterRef: HTMLInputElement | undefined;
 
@@ -105,23 +101,50 @@ export default function LogViewer(props: LogViewerProps) {
     localStorage.setItem("log-font-size", String(next));
   };
 
-  const processLines = (raw: string[]): string[] =>
-    raw
-      .flatMap((l) => l.replace(/\r/g, "").split("\n"))
-      .map((l) => l.trimEnd())
-      .filter((l) => l.length > 0);
+  const processLines = (raw: string[]): string[] => {
+    const out: string[] = [];
+    for (const chunk of raw) {
+      for (const l of chunk.replace(/\r/g, "").split("\n")) {
+        const line = l.trimEnd();
+        if (line.length > 0) out.push(line);
+      }
+    }
+    return out;
+  };
+
+  // Live lines arrive in batches from the Tauri side (one event per ~50 ms);
+  // apply them at most once per frame.
+  const incoming = createFrameBatcher<string>((raw) => {
+    const newLines = processLines(raw);
+    if (newLines.length === 0) return;
+    // When the user has scrolled up, trimming the head of the buffer
+    // would shift their viewport to unrelated content. Freeze the buffer
+    // and queue incoming lines until they re-enable autoscroll.
+    if (!autoScroll() && buffer.length + newLines.length > MAX_LINES) {
+      for (const l of newLines) pendingLines.push(l);
+      if (pendingLines.length > MAX_LINES) pendingLines.splice(0, pendingLines.length - MAX_LINES);
+      setPendingCount(pendingLines.length);
+      return;
+    }
+    buffer.push(newLines);
+    bump();
+  }, MAX_LINES);
 
   const fetchLogs = async () => {
     setLoading(true);
+    incoming.cancel();
+    pendingLines = [];
+    setPendingCount(0);
     try {
       const result = (await invoke("container_logs", {
         id: props.containerId,
         tail: tail(),
       })) as string[];
-      setLines(processLines(result));
+      buffer.reset(processLines(result));
     } catch (e) {
-      setLines([`Error fetching logs: ${e}`]);
+      buffer.reset([`Error fetching logs: ${e}`]);
     }
+    bump();
     setLoading(false);
   };
 
@@ -148,6 +171,7 @@ export default function LogViewer(props: LogViewerProps) {
     // unmounts, which bubbles up and breaks further reactive updates.
     onCleanup(() => {
       disposed = true;
+      incoming.cancel();
       try { unlisten?.(); } catch {}
       invoke("unsubscribe_container_logs", { id: containerId }).catch(() => {});
       document.removeEventListener("keydown", handleKeyDown);
@@ -155,28 +179,12 @@ export default function LogViewer(props: LogViewerProps) {
 
     fetchLogs().then(async () => {
       if (disposed) return;
-      unlisten = await listen<{ containerId: string; line: string }>(
-        "container-log-line",
+      unlisten = await listen<{ containerId: string; lines: string[] }>(
+        "container-log-lines",
         (event) => {
           if (disposed) return;
           if (event.payload.containerId === containerId) {
-            const newLines = processLines([event.payload.line]);
-            if (newLines.length === 0) return;
-            // When the user has scrolled up, trimming the head of the
-            // buffer would shift their viewport to unrelated content.
-            // Freeze the buffer and queue incoming lines until they
-            // re-enable autoscroll.
-            if (!autoScroll() && lines().length + newLines.length > MAX_LINES) {
-              setPendingLines((prev) => {
-                const combined = [...prev, ...newLines];
-                return combined.length > MAX_LINES ? combined.slice(-MAX_LINES) : combined;
-              });
-              return;
-            }
-            setLines((prev) => {
-              const combined = [...prev, ...newLines];
-              return combined.length > MAX_LINES ? combined.slice(-MAX_LINES) : combined;
-            });
+            incoming.push(event.payload.lines);
           }
         }
       );
@@ -197,75 +205,62 @@ export default function LogViewer(props: LogViewerProps) {
     document.addEventListener("keydown", handleKeyDown);
   });
 
-  createEffect(() => {
-    // Auto-scroll to bottom when new lines arrive
-    if (autoScroll() && logContainer) {
-      lines(); // track dependency
-      requestAnimationFrame(() => {
-        if (logContainer) {
-          logContainer.scrollTop = logContainer.scrollHeight;
-        }
-      });
+  // Line predicate for the current filter: returns the number of matches
+  // (0 hides the line), so the match count accumulates incrementally.
+  // null = no filter, or an invalid regex (fall back to no filtering).
+  const matcher = createMemo((): ((line: string) => number) | null => {
+    const f = filter();
+    if (!f) return null;
+    try {
+      const flags = caseSensitive() ? "g" : "gi";
+      const regex = useRegex() ? new RegExp(f, flags) : new RegExp(escapeRegex(f), flags);
+      return (line) => line.match(regex)?.length ?? 0;
+    } catch {
+      return null;
     }
   });
 
-  // Memoized so we only recompute / recompile the filter RegExp when one of
-  // the tracked signals changes. Previously this was a plain function that
-  // was called 4+ times per render (header count, matchCount, scroll
-  // effect, `<For>` source), each time rebuilding the regex from scratch.
-  const filtered = createMemo(() => {
-    const f = filter();
-    let result = lines();
-    if (f) {
-      try {
-        const flags = caseSensitive() ? "" : "i";
-        const regex = useRegex()
-          ? new RegExp(f, flags)
-          : new RegExp(escapeRegex(f), flags);
-        result = result.filter((l) => regex.test(l));
-      } catch {
-        // Invalid regex, fall back to no filtering
-      }
-    }
-    // Remove consecutive empty lines
-    return result.filter((line, i, arr) => {
-      if (line.trim() === "" && i > 0 && arr[i - 1].trim() === "") return false;
-      return true;
-    });
-  });
+  // Seqs of the lines that pass the filter. While the filter is unchanged
+  // only newly appended lines are tested. (No separate "consecutive empty
+  // lines" pass: processLines already drops blank lines.)
+  const filtered = createMemo(
+    () => {
+      version();
+      view.update(buffer, matcher());
+      return view.seqs;
+    },
+    undefined,
+    { equals: false },
+  );
 
   const matchCount = () => {
-    if (!filter()) return 0;
-    return countMatches(filtered(), filter(), useRegex(), caseSensitive());
+    filtered();
+    return filter() ? view.total : 0;
   };
 
+  const filteredText = () => filtered().map((seq) => buffer.at(seq)).join("\n");
+
   // Memoize the compiled highlight regex so we don't rebuild it per rendered
-  // line — the previous version called `new RegExp` on every `<For>` row.
+  // line — the previous version called `new RegExp` on every rendered row.
   const highlightRegex = createMemo(() =>
     compileHighlight(filter(), useRegex(), caseSensitive()),
   );
 
   const flushPendingLines = () => {
-    const pending = pendingLines();
-    if (pending.length === 0) return;
-    setPendingLines([]);
-    setLines((prev) => {
-      const combined = [...prev, ...pending];
-      return combined.length > MAX_LINES ? combined.slice(-MAX_LINES) : combined;
-    });
+    if (pendingLines.length === 0) return;
+    buffer.push(pendingLines);
+    pendingLines = [];
+    setPendingCount(0);
+    bump();
   };
 
   const resumeAutoScroll = () => {
     setAutoScroll(true);
     flushPendingLines();
-    if (logContainer) logContainer.scrollTop = logContainer.scrollHeight;
   };
 
-  const handleScroll = () => {
-    if (!logContainer) return;
-    const { scrollTop, scrollHeight, clientHeight } = logContainer;
+  const handleScrolled = (atBottom: boolean) => {
     // If user scrolled up more than 50px from bottom, disable auto-scroll
-    const atBottom = scrollHeight - scrollTop - clientHeight < 50;
     const wasOn = autoScroll();
     setAutoScroll(atBottom);
     // Scrolling back to the bottom should unfreeze the buffer.
@@ -273,12 +268,11 @@ export default function LogViewer(props: LogViewerProps) {
   };
 
   const copyAll = () => {
-    const text = filtered().join("\n");
-    copyToClipboard(text);
+    copyToClipboard(filteredText());
   };
 
   const downloadLogs = () => {
-    const text = filtered().join("\n");
+    const text = filteredText();
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const safeName = props.containerName.replace(/[^a-zA-Z0-9_-]/g, "_");
     const filename = `${safeName}-${timestamp}.log`;
@@ -418,13 +412,13 @@ export default function LogViewer(props: LogViewerProps) {
         </div>
       </div>
       <Show
-        when={!loading() || lines().length > 0}
+        when={!loading() || lineCount() > 0}
         fallback={
           <div class="log-loading">Loading logs...</div>
         }
       >
         <div style={{ position: "relative", flex: "1", "min-height": "0", display: "flex", "flex-direction": "column" }}>
-        <Show when={pendingLines().length > 0}>
+        <Show when={pendingCount() > 0}>
           <button
             onClick={resumeAutoScroll}
             style={{
@@ -446,55 +440,34 @@ export default function LogViewer(props: LogViewerProps) {
             }}
             title="Click to resume auto-scroll and load buffered lines"
           >
-            {pendingLines().length} new lines — click to resume
+            {pendingCount()} new lines — click to resume
           </button>
         </Show>
-        <div
-          class="log-content"
+        <VirtualLogList
           ref={logContainer}
-          onScroll={handleScroll}
-          style={{ "font-size": `${fontSize()}px`, overflow: "auto" }}
-        >
-          <Show when={filtered().length > 0} fallback={
-            <div style={{ "font-family": "'JetBrains Mono NF', monospace", "font-size": `${fontSize()}px`, color: "#8b949e", padding: "8px" }}>
+          class="log-content"
+          keys={filtered()}
+          textLength={(seq) => buffer.at(seq).length}
+          fontSize={fontSize()}
+          lineHeight={1.4}
+          follow={autoScroll()}
+          onScrolled={handleScrolled}
+          empty={
+            <div style={{ color: "#8b949e", padding: "8px" }}>
               (no log output)
             </div>
-          }>
-            <For each={filtered()}>
-              {(line) => {
-                const regex = highlightRegex();
-                if (regex) {
-                  return (
-                    <div
-                      style={{
-                        "font-family": "'JetBrains Mono NF', monospace",
-                        "font-size": `${fontSize()}px`,
-                        "white-space": "pre-wrap",
-                        "word-break": "break-all",
-                        "line-height": "1.4",
-                      }}
-                      // eslint-disable-next-line solid/no-innerhtml -- highlightLine produces pre-escaped HTML with safe <mark> tags
-                      innerHTML={highlightLine(line, regex)}
-                    />
-                  );
-                }
-                return (
-                  <div
-                    style={{
-                      "font-family": "'JetBrains Mono NF', monospace",
-                      "font-size": `${fontSize()}px`,
-                      "white-space": "pre-wrap",
-                      "word-break": "break-all",
-                      "line-height": "1.4",
-                    }}
-                  >
-                    {line}
-                  </div>
-                );
-              }}
-            </For>
-          </Show>
-        </div>
+          }
+          renderRow={(seq) => {
+            const line = buffer.at(seq);
+            return (
+              <div
+                class="log-line"
+                // eslint-disable-next-line solid/no-innerhtml -- highlightLine produces pre-escaped HTML with safe <mark> tags
+                innerHTML={highlightLine(line, highlightRegex())}
+              />
+            );
+          }}
+        />
         </div>
       </Show>
     </div>

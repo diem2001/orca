@@ -487,13 +487,42 @@ pub async fn container_logs(id: String, tail: Option<u32>) -> Result<Vec<String>
     Ok(lines)
 }
 
+/// Read an SSE response body one line at a time. Each line is consumed once
+/// (no re-copying of the unread remainder per line, which made the old
+/// `buffer = buffer[pos + 1..].to_string()` loop quadratic in chunk size) and
+/// decoded as a whole, so a multi-byte character split across two network
+/// chunks isn't mangled. Invalid UTF-8 is replaced rather than ending the
+/// stream — container output can be arbitrary bytes.
+fn sse_lines(resp: reqwest::Response) -> tokio::io::Split<impl tokio::io::AsyncBufRead + Unpin> {
+    use futures_util::TryStreamExt;
+    use tokio::io::AsyncBufReadExt;
+    let body = resp.bytes_stream().map_err(std::io::Error::other);
+    tokio_util::io::StreamReader::new(body).split(b'\n')
+}
+
+/// Live log lines are batched into one "container-log-lines" event per
+/// LOG_BATCH_INTERVAL or LOG_BATCH_MAX_LINES lines, whichever comes first.
+/// One IPC event per line flooded the webview (and its JSON parser) when a
+/// container logs thousands of lines per second.
+const LOG_BATCH_MAX_LINES: usize = 200;
+const LOG_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn emit_log_lines(app: &tauri::AppHandle, container_id: &str, lines: Vec<String>) {
+    use tauri::Emitter;
+    if lines.is_empty() {
+        return;
+    }
+    let _ = app.emit(
+        "container-log-lines",
+        serde_json::json!({ "containerId": container_id, "lines": lines }),
+    );
+}
+
 /// Subscribe to live log streaming for a container via SSE.
-/// Spawns a background task that emits "container-log-line" events.
+/// Spawns a background task that emits batched "container-log-lines" events
+/// (`{ containerId, lines: string[] }`).
 #[tauri::command]
 pub async fn subscribe_container_logs(app: tauri::AppHandle, id: String, tail: Option<u32>) -> Result<(), String> {
-    use futures_util::StreamExt;
-    use tauri::Emitter;
-
     // Abort any existing subscription for this container
     {
         let mut map = log_stream_map().lock().map_err(|e| format!("Lock poisoned: {e}"))?;
@@ -518,12 +547,10 @@ pub async fn subscribe_container_logs(app: tauri::AppHandle, id: String, tail: O
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = app.emit(
-                    "container-log-line",
-                    serde_json::json!({
-                        "containerId": container_id,
-                        "line": format!("Error connecting to log stream: {e}"),
-                    }),
+                emit_log_lines(
+                    &app,
+                    &container_id,
+                    vec![format!("Error connecting to log stream: {e}")],
                 );
                 return;
             }
@@ -531,41 +558,44 @@ pub async fn subscribe_container_logs(app: tauri::AppHandle, id: String, tail: O
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            let _ = app.emit(
-                "container-log-line",
-                serde_json::json!({
-                    "containerId": container_id,
-                    "line": format!("Log stream error: {body}"),
-                }),
-            );
+            emit_log_lines(&app, &container_id, vec![format!("Log stream error: {body}")]);
             return;
         }
 
-        let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut segments = sse_lines(resp);
+        let mut batch: Vec<String> = Vec::new();
+        // Set when the first line of a batch arrives; the batch is flushed
+        // once it passes even if no further line comes in.
+        let mut flush_at: Option<tokio::time::Instant> = None;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(_) => break,
+        loop {
+            // `next_segment` is cancel safe, so racing it against the flush
+            // deadline never loses a partially read line.
+            let next = match flush_at {
+                Some(deadline) => match tokio::time::timeout_at(deadline, segments.next_segment()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        emit_log_lines(&app, &container_id, std::mem::take(&mut batch));
+                        flush_at = None;
+                        continue;
+                    }
+                },
+                None => segments.next_segment().await,
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer = buffer[pos + 1..].to_string();
-
-                if let Some(data) = line.strip_prefix("data:") {
-                    let _ = app.emit(
-                        "container-log-line",
-                        serde_json::json!({
-                            "containerId": container_id,
-                            "line": data.to_string(),
-                        }),
-                    );
+            let Ok(Some(raw)) = next else { break };
+            let line = String::from_utf8_lossy(&raw);
+            if let Some(data) = line.trim().strip_prefix("data:") {
+                batch.push(data.to_string());
+                if batch.len() >= LOG_BATCH_MAX_LINES {
+                    emit_log_lines(&app, &container_id, std::mem::take(&mut batch));
+                    flush_at = None;
+                } else if flush_at.is_none() {
+                    flush_at = Some(tokio::time::Instant::now() + LOG_BATCH_INTERVAL);
                 }
             }
         }
+        // Stream ended (container stopped / daemon closed it): deliver the tail.
+        emit_log_lines(&app, &container_id, batch);
     });
 
     let mut map = log_stream_map().lock().map_err(|e| format!("Lock poisoned: {e}"))?;
@@ -845,35 +875,30 @@ pub async fn pull_image_stream(
     }
 
     // Stream SSE events to frontend
-    let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
+    let mut segments = sse_lines(resp);
+    while let Some(raw) = segments
+        .next_segment()
+        .await
+        .map_err(|e| format!("Stream error: {e}"))?
+    {
+        let line = String::from_utf8_lossy(&raw);
+        let line = line.trim();
 
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Stream error: {e}"))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        // Process complete lines
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim().to_string();
-            buffer = buffer[pos + 1..].to_string();
-
-            if let Some(data) = line.strip_prefix("data:") {
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim()) {
-                    let _ = app.emit(
-                        "pull-progress",
-                        serde_json::json!({
-                            "event": "progress",
-                            "layer": event.get("layer").and_then(|v| v.as_str()).unwrap_or(""),
-                            "status": event.get("status").and_then(|v| v.as_str()).unwrap_or(""),
-                            "current": event.get("current").and_then(|v| v.as_u64()).unwrap_or(0),
-                            "total": event.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
-                        }),
-                    );
-                }
-            } else if line.starts_with("event: done") {
-                let _ = app.emit("pull-progress", serde_json::json!({ "event": "done" }));
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim()) {
+                let _ = app.emit(
+                    "pull-progress",
+                    serde_json::json!({
+                        "event": "progress",
+                        "layer": event.get("layer").and_then(|v| v.as_str()).unwrap_or(""),
+                        "status": event.get("status").and_then(|v| v.as_str()).unwrap_or(""),
+                        "current": event.get("current").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "total": event.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
+                    }),
+                );
             }
+        } else if line.starts_with("event: done") {
+            let _ = app.emit("pull-progress", serde_json::json!({ "event": "done" }));
         }
     }
 
@@ -2531,29 +2556,22 @@ pub async fn env_fix_stream(app: tauri::AppHandle, action: String) -> Result<(),
             }
         };
 
-        use futures_util::StreamExt;
-        let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut segments = sse_lines(resp);
 
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    // Process complete SSE lines
-                    while let Some(newline_pos) = buffer.find('\n') {
-                        let line = buffer[..newline_pos].to_string();
-                        buffer = buffer[newline_pos + 1..].to_string();
-
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" {
-                                let _ = app.emit("env-fix-done", "success");
-                                return;
-                            } else if data == "[ERROR]" {
-                                let _ = app.emit("env-fix-done", "error");
-                                return;
-                            } else {
-                                let _ = app.emit("env-fix-line", data.to_string());
-                            }
+        loop {
+            match segments.next_segment().await {
+                Ok(None) => break,
+                Ok(Some(raw)) => {
+                    let line = String::from_utf8_lossy(&raw);
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            let _ = app.emit("env-fix-done", "success");
+                            return;
+                        } else if data == "[ERROR]" {
+                            let _ = app.emit("env-fix-done", "error");
+                            return;
+                        } else {
+                            let _ = app.emit("env-fix-line", data.to_string());
                         }
                     }
                 }
