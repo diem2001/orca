@@ -26,3 +26,4 @@ base64.workspace = true
 serde_yaml = "0.9"
 rand = { workspace = true }
 tempfile = "3"
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }

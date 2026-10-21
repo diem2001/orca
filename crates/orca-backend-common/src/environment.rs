@@ -2924,125 +2924,39 @@ pub fn summarize_disk_usage(df: &bollard::models::SystemDataUsageResponse) -> Di
     }
 }
 
-/// Parse a value in kB from /proc/meminfo.
-fn parse_meminfo_kb(meminfo: &str, key: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if line.starts_with(key) {
-            // Format: "MemTotal:       16384000 kB"
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                return parts[1].parse::<u64>().ok();
-            }
-        }
-    }
-    None
+/// Get system resource info.
+/// Host CPU, memory and disk. Read through the OS's own APIs rather than by
+/// running `sysctl`/`vm_stat`/`df` or PowerShell: health is polled, and each
+/// of those cost a process (PowerShell most of a CPU second).
+pub async fn get_system_resources() -> Option<SystemResources> {
+    tokio::task::spawn_blocking(system_resources).await.ok()
 }
 
-/// Get system resource info.
-pub async fn get_system_resources() -> Option<SystemResources> {
+fn system_resources() -> SystemResources {
     let cpu_count = std::thread::available_parallelism()
         .map(|p| p.get() as u32)
         .unwrap_or(1);
 
-    // Memory from /proc/meminfo (Linux)
-    let (memory_total, memory_available) = if cfg!(target_os = "linux") {
-        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-            let total = parse_meminfo_kb(&meminfo, "MemTotal:").map(|kb| kb * 1024).unwrap_or(0);
-            let available = parse_meminfo_kb(&meminfo, "MemAvailable:")
-                .map(|kb| kb * 1024)
-                .unwrap_or(0);
-            (total, available)
-        } else {
-            (0, 0)
-        }
-    } else if cfg!(target_os = "macos") {
-        // macOS: use sysctl for memory
-        let total = match run_cmd("sysctl", &["-n", "hw.memsize"]).await {
-            Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
-            Err(_) => 0,
-        };
-        // Get page size and free pages for available memory
-        let available = match run_cmd("vm_stat", &[]).await {
-            Ok(output) => {
-                let page_size = 16384u64; // default on Apple Silicon
-                let free_pages = output
-                    .lines()
-                    .find(|l| l.contains("Pages free"))
-                    .and_then(|l| l.split_whitespace().last())
-                    .and_then(|s| s.trim_end_matches('.').parse::<u64>().ok())
-                    .unwrap_or(0);
-                let inactive_pages = output
-                    .lines()
-                    .find(|l| l.contains("Pages inactive"))
-                    .and_then(|l| l.split_whitespace().last())
-                    .and_then(|s| s.trim_end_matches('.').parse::<u64>().ok())
-                    .unwrap_or(0);
-                (free_pages + inactive_pages) * page_size
-            }
-            Err(_) => total / 2, // rough fallback
-        };
-        (total, available)
-    } else if cfg!(target_os = "windows") {
-        // Windows: use PowerShell to query OS memory info
-        match run_cmd("powershell", &["-NoProfile", "-Command",
-            "Get-CimInstance Win32_OperatingSystem | ForEach-Object { \"$($_.TotalVisibleMemorySize) $($_.FreePhysicalMemory)\" }"
-        ]).await {
-            Ok(output) => {
-                let parts: Vec<&str> = output.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let total_kb = parts[0].parse::<u64>().unwrap_or(0);
-                    let free_kb = parts[1].parse::<u64>().unwrap_or(0);
-                    (total_kb * 1024, free_kb * 1024)
-                } else {
-                    (0, 0)
-                }
-            }
-            Err(_) => (0, 0),
-        }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let memory_total = sys.total_memory();
+    // sysinfo's macOS "available" subtracts compressed pages from free +
+    // inactive and bottoms out at 0 under memory compression; total minus
+    // used (active, wired, compressed) is what Activity Monitor implies.
+    let memory_available = if cfg!(target_os = "macos") {
+        memory_total.saturating_sub(sys.used_memory())
     } else {
-        (0, 0)
+        sys.available_memory()
     };
 
-    // Disk usage
-    let (disk_total, disk_free) = if cfg!(target_os = "windows") {
-        // Windows: use PowerShell to get disk info for C:
-        match run_cmd("powershell", &["-NoProfile", "-Command",
-            "Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\" | ForEach-Object { \"$($_.Size) $($_.FreeSpace)\" }"
-        ]).await {
-            Ok(output) => {
-                let parts: Vec<&str> = output.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let total = parts[0].parse::<u64>().unwrap_or(0);
-                    let free = parts[1].parse::<u64>().unwrap_or(0);
-                    (total, free)
-                } else {
-                    (0, 0)
-                }
-            }
-            Err(_) => (0, 0),
-        }
-    } else {
-        // Linux/macOS: use df -k
-        match run_cmd("df", &["-k", "/"]).await {
-            Ok(output) => {
-                let mut total = 0u64;
-                let mut free = 0u64;
-                for (i, line) in output.lines().enumerate() {
-                    if i == 0 {
-                        continue;
-                    }
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        total = parts[1].parse::<u64>().unwrap_or(0) * 1024; // KB to bytes
-                        free = parts[3].parse::<u64>().unwrap_or(0) * 1024;
-                    }
-                    break;
-                }
-                (total, free)
-            }
-            Err(_) => (0, 0),
-        }
-    };
+    // The system drive, as `df /` or drive C: reported it.
+    let root = std::path::Path::new(if cfg!(target_os = "windows") { "C:\\" } else { "/" });
+    let (disk_total, disk_free) = sysinfo::Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .find(|d| d.mount_point() == root)
+        .map(|d| (d.total_space(), d.available_space()))
+        .unwrap_or((0, 0));
 
     let disk_usage_percent = if disk_total > 0 {
         ((disk_total - disk_free) as f64 / disk_total as f64) * 100.0
@@ -3050,14 +2964,14 @@ pub async fn get_system_resources() -> Option<SystemResources> {
         0.0
     };
 
-    Some(SystemResources {
+    SystemResources {
         cpu_count,
         memory_total_bytes: memory_total,
         memory_available_bytes: memory_available,
         disk_total_bytes: disk_total,
         disk_free_bytes: disk_free,
         disk_usage_percent,
-    })
+    }
 }
 
 /// System health from the host's side: memory, disk and GPU, plus the
@@ -3300,14 +3214,6 @@ mod tests {
     fn summarize_disk_usage_of_an_empty_engine() {
         let du = summarize_disk_usage(&Default::default());
         assert_eq!((du.total_size_bytes, du.reclaimable_bytes), (0, 0));
-    }
-
-    #[test]
-    fn parse_meminfo_kb_extracts_value() {
-        let meminfo = "MemTotal:       16384000 kB\nMemFree:         1234567 kB\nMemAvailable:   8000000 kB\n";
-        assert_eq!(parse_meminfo_kb(meminfo, "MemTotal:"), Some(16384000));
-        assert_eq!(parse_meminfo_kb(meminfo, "MemAvailable:"), Some(8000000));
-        assert_eq!(parse_meminfo_kb(meminfo, "SwapTotal:"), None);
     }
 
     #[test]

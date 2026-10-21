@@ -12,6 +12,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
+use orca_core::dev::OrcaYaml;
+
 use super::{deploy, jobs, project::ProjectCtx};
 use crate::state::AppState;
 
@@ -195,15 +197,24 @@ fn hosts_in(bytes: &[u8]) -> HashSet<String> {
 }
 
 async fn stop_idle(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let ids: Vec<String> = state
+    let projects: Vec<(String, std::path::PathBuf)> = state
         .config
         .lock()
         .await
         .dev_projects
         .iter()
-        .map(|p| p.id.clone())
+        .map(|p| (p.id.clone(), p.root.clone()))
         .collect();
-    for id in ids {
+    for (id, root) in projects {
+        // Only projects that set `idle_stop` need the full context (git,
+        // containers); this runs every minute whether anyone looks or not.
+        let wants_idle_stop = OrcaYaml::load(&root)
+            .ok()
+            .and_then(|y| y.dev)
+            .is_some_and(|d| d.instance.idle_stop.is_some());
+        if !wants_idle_stop {
+            continue;
+        }
         let Ok(ctx) = ProjectCtx::load(state, &id).await else {
             continue;
         };

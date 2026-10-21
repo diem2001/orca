@@ -1,5 +1,6 @@
 //! Bridge Docker/Podman events to Orca events.
 
+use bollard::models::EventMessageTypeEnum;
 use bollard::system::EventsOptions;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -8,13 +9,35 @@ use orca_core::event::{Event, EventKind};
 
 use crate::BollardRuntime;
 
-impl BollardRuntime {
-    /// Start listening to Docker events and broadcast them as Orca events.
-    /// Returns a broadcast receiver that the daemon can subscribe to.
-    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
-        let (tx, rx) = broadcast::channel(256);
+/// Container actions that don't change what `GET /containers/json` returns.
+/// `exec_*` matter most: a healthcheck runs one every few seconds.
+fn changes_container_list(action: &str) -> bool {
+    !(action.starts_with("exec_")
+        || matches!(
+            action,
+            "attach" | "detach" | "resize" | "top" | "archive-path" | "extract-to-dir" | "export" | "copy" | "commit"
+        ))
+}
 
+impl BollardRuntime {
+    /// Docker events as Orca events. All subscribers share one event stream,
+    /// started on the first call and ended when this runtime is dropped. The
+    /// stream also drops the runtime's cached lists when Docker reports a
+    /// change, before passing the event on, so a subscriber that refetches on
+    /// an event sees the change.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        let rx = self.events.subscribe();
+        self.events_started.call_once(|| self.spawn_event_stream());
+        rx
+    }
+
+    fn spawn_event_stream(&self) {
+        let tx = self.events.clone();
         let docker = self.docker.clone();
+        let containers = self.containers.clone();
+        let images = self.images.clone();
+        let disk = self.disk.clone();
+        let mut alive = self.alive.subscribe();
         tokio::spawn(async move {
             // Reconnect with exponential backoff. Without this, a single
             // transient error ended the event stream forever and the UI
@@ -22,17 +45,43 @@ impl BollardRuntime {
             // daemon.
             let mut backoff_secs: u64 = 1;
             loop {
+                // Changes made while no stream was open went unreported.
+                containers.forget();
+                images.forget();
                 let options = EventsOptions::<String> { ..Default::default() };
                 let inspect_docker = docker.clone();
                 let mut stream = docker.events(Some(options));
                 let mut had_successful_read = false;
 
-                while let Some(item) = stream.next().await {
+                loop {
+                    let item = tokio::select! {
+                        item = stream.next() => item,
+                        // The runtime was dropped (replaced by a reconnect).
+                        _ = alive.changed() => return,
+                    };
+                    let Some(item) = item else { break };
                     match item {
                         Ok(event) => {
                             had_successful_read = true;
-                            let kind = match (event.typ.as_ref().map(|t| format!("{t:?}")), event.action.as_deref()) {
-                                (Some(typ), Some(action)) if typ.contains("Container") => {
+                            let typ = event.typ;
+                            let action = event.action.as_deref().unwrap_or_default();
+                            if typ == Some(EventMessageTypeEnum::CONTAINER) && changes_container_list(action) {
+                                containers.forget();
+                                if action == "destroy" {
+                                    disk.forget();
+                                }
+                            } else if typ == Some(EventMessageTypeEnum::IMAGE) && !matches!(action, "save" | "push") {
+                                images.forget();
+                                if matches!(action, "delete" | "untag") {
+                                    disk.forget();
+                                }
+                            } else if typ == Some(EventMessageTypeEnum::VOLUME) && action == "destroy" {
+                                disk.forget();
+                            }
+                            // The type's Debug form is upper case (`CONTAINER`), so
+                            // compare the enum, not its name.
+                            let kind = match (typ, event.action.as_deref()) {
+                                (Some(EventMessageTypeEnum::CONTAINER), Some(action)) => {
                                     let id = event.actor.as_ref().and_then(|a| a.id.clone()).unwrap_or_default();
                                     let name = event
                                         .actor
@@ -74,7 +123,7 @@ impl BollardRuntime {
                                         _ => None,
                                     }
                                 }
-                                (Some(typ), Some(action)) if typ.contains("Image") => {
+                                (Some(EventMessageTypeEnum::IMAGE), Some(action)) => {
                                     let id = event.actor.as_ref().and_then(|a| a.id.clone()).unwrap_or_default();
 
                                     match action {
@@ -86,7 +135,7 @@ impl BollardRuntime {
                                         _ => None,
                                     }
                                 }
-                                (Some(typ), Some(action)) if typ.contains("Volume") => {
+                                (Some(EventMessageTypeEnum::VOLUME), Some(action)) => {
                                     let name = event.actor.as_ref().and_then(|a| a.id.clone()).unwrap_or_default();
 
                                     match action {
@@ -123,10 +172,11 @@ impl BollardRuntime {
                     backoff_secs = (backoff_secs * 2).min(60);
                 }
                 tracing::info!("Docker event stream reconnecting in {backoff_secs}s");
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    _ = alive.changed() => return,
+                }
             }
         });
-
-        rx
     }
 }

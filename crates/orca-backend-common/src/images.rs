@@ -6,22 +6,29 @@ use orca_core::image::*;
 use crate::BollardRuntime;
 
 impl ImageManager for BollardRuntime {
+    /// Served from a cache that image events keep current (see `IMAGES_TTL`).
     async fn list(&self) -> anyhow::Result<Vec<Image>> {
-        let options = ListImagesOptions::<String> {
-            all: false,
-            ..Default::default()
-        };
-        let images = self.docker.list_images(Some(options)).await?;
+        self.images
+            .get(false, || async {
+                let options = ListImagesOptions::<String> {
+                    all: false,
+                    ..Default::default()
+                };
+                let images = self.docker.list_images(Some(options)).await?;
 
-        Ok(images
-            .iter()
-            .map(|img| Image {
-                id: img.id.clone(),
-                repo_tags: img.repo_tags.clone(),
-                size_bytes: img.size as u64,
-                created_at: img.created.to_string(),
+                anyhow::Ok(
+                    images
+                        .iter()
+                        .map(|img| Image {
+                            id: img.id.clone(),
+                            repo_tags: img.repo_tags.clone(),
+                            size_bytes: img.size as u64,
+                            created_at: img.created.to_string(),
+                        })
+                        .collect(),
+                )
             })
-            .collect())
+            .await
     }
 
     async fn pull(&self, reference: &str) -> anyhow::Result<tokio::sync::mpsc::Receiver<PullProgress>> {
@@ -87,6 +94,7 @@ impl ImageManager for BollardRuntime {
                 None,
             )
             .await?;
+        self.forget_images();
         Ok(())
     }
 
@@ -102,6 +110,7 @@ impl ImageManager for BollardRuntime {
 
     async fn prune(&self) -> anyhow::Result<PruneResult> {
         let result = self.docker.prune_images::<String>(None).await?;
+        self.forget_images();
         let images_deleted = result
             .images_deleted
             .unwrap_or_default()
@@ -118,6 +127,7 @@ impl ImageManager for BollardRuntime {
         self.docker
             .tag_image(source, Some(TagImageOptions { repo, tag }))
             .await?;
+        self.forget_images();
         Ok(())
     }
 

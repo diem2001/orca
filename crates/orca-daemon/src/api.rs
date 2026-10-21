@@ -221,6 +221,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/containers/{id}/stop", post(stop_container))
         .route("/containers/{id}/kill", post(kill_container))
         .route("/containers/{id}", delete(remove_container))
+        .route("/containers/stats", get(all_container_stats))
         .route("/containers/{id}/stats", get(container_stats))
         .route("/containers/{id}/logs", get(container_logs_sse))
         .route("/containers/{id}/update", post(update_container))
@@ -733,6 +734,11 @@ async fn create_container(
     let id = state.rt().await.create_container(opts).await?;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+}
+
+/// Stats of all running containers, for views that show many at once.
+async fn all_container_stats(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.rt().await.all_container_stats().await?))
 }
 
 async fn container_stats(
@@ -7446,11 +7452,13 @@ fn extended_path() -> String {
     )
 }
 
-/// Try to ping a Docker socket and return the server version + client on success.
-async fn try_socket_ping(socket_path: &str) -> Option<(String, bollard::Docker)> {
+/// Ping a Docker socket and return a client for it if it answers. Pings, not
+/// `GET /version`: that leaks memory in rootless dockerd, and this probes
+/// every socket it finds.
+async fn try_socket_ping(socket_path: &str) -> Option<bollard::Docker> {
     let docker = bollard::Docker::connect_with_socket(socket_path, 120, bollard::API_DEFAULT_VERSION).ok()?;
-    let ver = docker.version().await.ok()?;
-    ver.version.map(|v| (v, docker))
+    docker.ping().await.ok()?;
+    Some(docker)
 }
 
 async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
@@ -7471,9 +7479,8 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                 let exists = std::path::Path::new(path).exists();
                 if exists {
                     match try_socket_ping(path).await {
-                        Some((v, docker_client)) => {
-                            log.push(format!("  Socket exists \u{2713} \u{2192} Docker {v} \u{2713}"));
-                            connected_version = Some(v.clone());
+                        Some(docker_client) => {
+                            log.push("  Socket exists \u{2713} \u{2192} Docker responds \u{2713}".to_string());
                             connected_method = Some(format!("DOCKER_HOST ({path})"));
                             connected_docker = Some(docker_client);
                             connected_socket = Some(path.to_string());
@@ -7511,10 +7518,9 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                 let uri = uri.trim();
                 if let Some(path) = uri.strip_prefix("unix://") {
                     let exists = std::path::Path::new(path).exists();
-                    if exists && connected_version.is_none() {
-                        if let Some((v, _docker_client)) = try_socket_ping(path).await {
-                            log.push(format!("  Context socket: found \u{2713} \u{2192} Docker {v} \u{2713}"));
-                            connected_version = Some(v);
+                    if exists && connected_method.is_none() {
+                        if try_socket_ping(path).await.is_some() {
+                            log.push("  Context socket: found \u{2713} \u{2192} Docker responds \u{2713}".to_string());
                             connected_method = Some(format!("Docker context ({path})"));
                         } else {
                             log.push("  Context socket: found but ping failed".to_string());
@@ -7565,10 +7571,11 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
         let exists = std::path::Path::new(path).exists();
         if exists {
             match try_socket_ping(path).await {
-                Some((v, docker_client)) => {
-                    log.push(format!("Socket {path}: found \u{2713} \u{2192} Docker {v} \u{2713}"));
-                    if connected_version.is_none() {
-                        connected_version = Some(v.clone());
+                Some(docker_client) => {
+                    log.push(format!(
+                        "Socket {path}: found \u{2713} \u{2192} Docker responds \u{2713}"
+                    ));
+                    if connected_method.is_none() {
                         connected_method = Some(format!("{label} ({path})"));
                         connected_docker = Some(docker_client);
                         connected_socket = Some(path.clone());
@@ -7584,7 +7591,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
 
     // 4. On macOS, check Lima VMs and try to start if needed
     #[cfg(target_os = "macos")]
-    if connected_version.is_none() {
+    if connected_method.is_none() {
         // Check Lima VMs
         match tokio::process::Command::new("limactl")
             .env("PATH", &extended)
@@ -7624,9 +7631,8 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                                     let socket = format!("{home}/.lima/{name}/sock/docker.sock");
                                     for attempt in 1..=15 {
                                         if std::path::Path::new(&socket).exists() {
-                                            if let Some((v, docker_client)) = try_socket_ping(&socket).await {
-                                                log.push(format!("  Socket ready \u{2713} \u{2192} Docker {v} \u{2713} (attempt {attempt})"));
-                                                connected_version = Some(v.clone());
+                                            if let Some(docker_client) = try_socket_ping(&socket).await {
+                                                log.push(format!("  Socket ready \u{2713} \u{2192} Docker responds \u{2713} (attempt {attempt})"));
                                                 connected_method = Some(format!("Lima VM '{name}' ({socket})"));
                                                 connected_docker = Some(docker_client);
                                                 connected_socket = Some(socket.clone());
@@ -7637,7 +7643,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                                             tokio::time::sleep(Duration::from_secs(2)).await;
                                         }
                                     }
-                                    if connected_version.is_none() {
+                                    if connected_method.is_none() {
                                         log.push(format!("  Socket not available after 30s"));
                                     }
                                 }
@@ -7647,7 +7653,7 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
                                 }
                                 Err(e) => log.push(format!("  Failed to start: {e}")),
                             }
-                            if connected_version.is_some() {
+                            if connected_method.is_some() {
                                 break;
                             }
                         }
@@ -7761,6 +7767,10 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
             runtime = runtime.with_socket(socket);
         }
         let new_runtime = Arc::new(runtime);
+        // One `/version` for display, cached by the runtime for health checks.
+        if let Ok(ver) = new_runtime.server_version().await {
+            connected_version = ver.version;
+        }
         state.swap_runtime(new_runtime).await;
         log.push("".to_string());
         log.push("\u{2713} Runtime connection updated — Docker is now connected.".to_string());
@@ -7768,7 +7778,8 @@ async fn reconnect_runtime(State(state): State<Arc<AppState>>) -> Result<impl In
 
     // Summary
     log.push("".to_string());
-    if let (Some(version), Some(method)) = (&connected_version, &connected_method) {
+    if let Some(method) = &connected_method {
+        let version = connected_version.as_deref().unwrap_or("(version unknown)");
         log.push(format!("Result: Docker {version} is reachable via {method}."));
         log.push("Connected successfully — no restart needed.".to_string());
         Ok(Json(serde_json::json!({
@@ -8099,8 +8110,9 @@ async fn agent_mcp(
 // --- Gateway ---
 
 async fn gateway_status(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let config = state.config.lock().await;
-    let gw = &config.gateway;
+    // Copy the gateway config out: holding the config lock across the
+    // Docker calls below would stall every other request that needs it.
+    let gw = state.config.lock().await.gateway.clone();
     let running = crate::gateway::is_running(&state).await.unwrap_or(false);
     let cid = crate::gateway::container_id(&state).await.unwrap_or(None);
     let routes_active = gw.routes.iter().filter(|r| r.enabled).count();

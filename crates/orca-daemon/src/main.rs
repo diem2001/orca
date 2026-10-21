@@ -111,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
                     tokio::select! {
                         event = events_rx.recv() => match event {
                             Ok(event) => { let _ = events_tx_clone.send(event); }
-                            Err(_) => break,
+                            // Some events were dropped; the stream itself is fine.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         },
                         _ = notified => break,
                     }

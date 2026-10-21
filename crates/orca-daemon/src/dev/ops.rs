@@ -60,13 +60,58 @@ pub async fn worktree_root(path: &Path) -> Result<PathBuf> {
     Ok(canonical(Path::new(&top)))
 }
 
+/// The repository's worktrees. Projects are listed every few seconds (the
+/// Projects page, the dashboard, the tray), so the list is reused until git's
+/// own files say a worktree was added, removed or moved to another commit.
 pub async fn list_worktrees(root: &Path) -> Result<Vec<Worktree>> {
+    type Cached = (Vec<(PathBuf, Option<std::time::SystemTime>)>, Instant, Vec<Worktree>);
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Cached>>> = OnceLock::new();
+    const MAX_AGE: Duration = Duration::from_secs(60);
+
+    let fingerprint = worktrees_fingerprint(root);
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((fp, at, wts)) = cache.lock().await.get(root)
+        && *fp == fingerprint
+        && at.elapsed() < MAX_AGE
+    {
+        return Ok(wts.clone());
+    }
     let out = git(root, &["worktree", "list", "--porcelain"]).await?;
     let mut wts = worktree::parse_porcelain(&out);
     for wt in &mut wts {
         wt.path = canonical(&wt.path);
     }
+    cache
+        .lock()
+        .await
+        .insert(root.to_path_buf(), (fingerprint, Instant::now(), wts.clone()));
     Ok(wts)
+}
+
+/// Modification times of the files `git worktree list` reads: each
+/// worktree's HEAD and HEAD reflog (written on every commit, checkout and
+/// reset), lock marker and location, and the folder that lists them.
+fn worktrees_fingerprint(root: &Path) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let git_dir = root.join(".git");
+    let mut files = vec![
+        git_dir.join("HEAD"),
+        git_dir.join("logs/HEAD"),
+        git_dir.join("worktrees"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(git_dir.join("worktrees")) {
+        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for d in dirs {
+            files.extend(["HEAD", "logs/HEAD", "locked", "gitdir"].map(|f| d.join(f)));
+        }
+    }
+    files
+        .into_iter()
+        .map(|f| {
+            let mtime = std::fs::metadata(&f).and_then(|m| m.modified()).ok();
+            (f, mtime)
+        })
+        .collect()
 }
 
 /// Commits on `branch` that `base` doesn't have. `None` when it can't be told.
@@ -101,10 +146,23 @@ pub async fn branches_with_gone_upstream(root: &Path) -> Vec<String> {
 }
 
 /// Whether the worktree has uncommitted changes (ignoring Orca's own folder).
+/// `git status` scans the whole worktree, and the Projects page asks for
+/// every instance every few seconds, so the answer is reused briefly.
 pub async fn is_dirty(dir: &Path) -> bool {
-    git(dir, &["status", "--porcelain", "--", ".", ":!.orca"])
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+    const MAX_AGE: Duration = Duration::from_secs(15);
+
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, dirty)) = cache.lock().await.get(dir)
+        && at.elapsed() < MAX_AGE
+    {
+        return *dirty;
+    }
+    let dirty = git(dir, &["status", "--porcelain", "--", ".", ":!.orca"])
         .await
-        .is_ok_and(|s| !s.is_empty())
+        .is_ok_and(|s| !s.is_empty());
+    cache.lock().await.insert(dir.to_path_buf(), (Instant::now(), dirty));
+    dirty
 }
 
 pub fn canonical(p: &Path) -> PathBuf {

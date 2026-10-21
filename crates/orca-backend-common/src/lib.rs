@@ -26,6 +26,21 @@ const VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// few seconds.
 const DISK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long the container list is reused. Docker events drop it as soon as
+/// a container changes, so this only bounds staleness if events are missed.
+/// The GUI asks for the list from several places every few seconds, and
+/// each `GET /containers/json` costs dockerd and containerd ~0.15 CPU s.
+const CONTAINERS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the image list is reused; image events drop it sooner. With the
+/// containerd image store, `GET /images/json` sizes every image and costs
+/// over a CPU second with a few dozen images.
+const IMAGES_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the stats of all running containers are reused, so that several
+/// views polling at once cost one round of stats requests.
+const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Shared container runtime client backed by bollard.
 /// Each platform backend embeds this and delegates trait impls to it.
 pub struct BollardRuntime {
@@ -35,7 +50,20 @@ pub struct BollardRuntime {
     /// reach the same engine as the API client whatever the CLI context says.
     pub host: Option<String>,
     version: tokio::sync::Mutex<Option<(std::time::Instant, bollard::system::Version)>>,
-    disk: TtlCache<orca_core::environment::DiskUsage>,
+    disk: std::sync::Arc<TtlCache<orca_core::environment::DiskUsage>>,
+    containers: std::sync::Arc<TtlCache<Vec<orca_core::runtime::Container>>>,
+    images: std::sync::Arc<TtlCache<Vec<orca_core::image::Image>>>,
+    stats: TtlCache<Vec<orca_core::runtime::ContainerStats>>,
+    /// Each container's last CPU reading (container total, host total), to
+    /// work out CPU % between two polls: one-shot stats carry no previous
+    /// reading of their own.
+    cpu_samples: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    /// Docker events as Orca events, fed by one stream per runtime that
+    /// starts on the first subscription (see `subscribe_events`).
+    events: tokio::sync::broadcast::Sender<orca_core::event::Event>,
+    events_started: std::sync::Once,
+    /// Dropped with the runtime, which ends its event stream.
+    alive: tokio::sync::watch::Sender<()>,
 }
 
 impl BollardRuntime {
@@ -44,7 +72,14 @@ impl BollardRuntime {
             docker,
             host: None,
             version: tokio::sync::Mutex::new(None),
-            disk: TtlCache::new(DISK_TTL),
+            disk: std::sync::Arc::new(TtlCache::new(DISK_TTL)),
+            containers: std::sync::Arc::new(TtlCache::new(CONTAINERS_TTL)),
+            images: std::sync::Arc::new(TtlCache::new(IMAGES_TTL)),
+            stats: TtlCache::new(STATS_TTL),
+            cpu_samples: Default::default(),
+            events: tokio::sync::broadcast::channel(256).0,
+            events_started: std::sync::Once::new(),
+            alive: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -109,6 +144,17 @@ impl BollardRuntime {
     /// Drop the cached disk usage, e.g. after images or volumes were removed.
     pub fn forget_disk(&self) {
         self.disk.forget();
+    }
+
+    /// Drop the cached container list after changing a container. Docker's
+    /// events do it too, but they arrive a moment after the change.
+    pub fn forget_containers(&self) {
+        self.containers.forget();
+    }
+
+    /// Drop the cached image list after changing images.
+    pub fn forget_images(&self) {
+        self.images.forget();
     }
 
     /// Detect whether we're talking to Docker or Podman.

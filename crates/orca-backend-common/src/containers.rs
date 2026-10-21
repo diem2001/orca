@@ -98,11 +98,13 @@ impl ContainerRuntime for BollardRuntime {
         });
 
         let response = self.docker.create_container(create_opts, config).await?;
+        self.forget_containers();
         Ok(response.id)
     }
 
     async fn start_container(&self, id: &str) -> anyhow::Result<()> {
         self.docker.start_container::<String>(id, None).await?;
+        self.forget_containers();
         Ok(())
     }
 
@@ -110,6 +112,7 @@ impl ContainerRuntime for BollardRuntime {
         self.docker
             .stop_container(id, Some(StopContainerOptions { t: timeout_secs as i64 }))
             .await?;
+        self.forget_containers();
         Ok(())
     }
 
@@ -117,6 +120,7 @@ impl ContainerRuntime for BollardRuntime {
         self.docker
             .kill_container(id, Some(KillContainerOptions { signal }))
             .await?;
+        self.forget_containers();
         Ok(())
     }
 
@@ -130,6 +134,7 @@ impl ContainerRuntime for BollardRuntime {
                 }),
             )
             .await?;
+        self.forget_containers();
         Ok(())
     }
 
@@ -138,14 +143,32 @@ impl ContainerRuntime for BollardRuntime {
         Ok(inspect_to_container(&info))
     }
 
+    /// Served from a cache of all containers that Docker events keep current
+    /// (see `CONTAINERS_TTL`); `all: false` filters it the way `docker ps` does.
     async fn list_containers(&self, all: bool) -> anyhow::Result<Vec<Container>> {
-        let options = ListContainersOptions::<String> {
-            all,
-            ..Default::default()
-        };
-        let containers = self.docker.list_containers(Some(options)).await?;
-
-        Ok(containers.iter().map(summary_to_container).collect())
+        let containers = self
+            .containers
+            .get(false, || async {
+                let options = ListContainersOptions::<String> {
+                    all: true,
+                    ..Default::default()
+                };
+                let containers = self.docker.list_containers(Some(options)).await?;
+                anyhow::Ok(containers.iter().map(summary_to_container).collect::<Vec<_>>())
+            })
+            .await?;
+        if all {
+            return Ok(containers);
+        }
+        Ok(containers
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.state,
+                    ContainerState::Running | ContainerState::Paused | ContainerState::Restarting
+                )
+            })
+            .collect())
     }
 
     async fn container_logs(
@@ -203,21 +226,47 @@ impl ContainerRuntime for BollardRuntime {
             .await
             .ok_or_else(|| anyhow::anyhow!("no stats returned"))??;
 
-        let cpu_delta = stats.cpu_stats.cpu_usage.total_usage as f64 - stats.precpu_stats.cpu_usage.total_usage as f64;
-        let system_delta = stats.cpu_stats.system_cpu_usage.unwrap_or(0) as f64
-            - stats.precpu_stats.system_cpu_usage.unwrap_or(0) as f64;
+        // CPU % over the time since the previous reading. One-shot stats have
+        // no previous reading (`precpu_stats` is empty), so use our own from
+        // the last poll; without either, the figure would be the average
+        // since the host booted.
+        let total = stats.cpu_stats.cpu_usage.total_usage;
+        let system = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
+        let previous = match stats.precpu_stats.system_cpu_usage {
+            Some(pre_system) if pre_system > 0 => Some((stats.precpu_stats.cpu_usage.total_usage, pre_system)),
+            _ => self.cpu_samples.lock().unwrap().insert(id.to_string(), (total, system)),
+        };
         let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
+        let cpu_percent = match previous {
+            Some((pre_total, pre_system)) if system > pre_system && total >= pre_total => {
+                (total - pre_total) as f64 / (system - pre_system) as f64 * num_cpus * 100.0
+            }
+            _ => 0.0,
+        };
 
-        let cpu_percent = if system_delta > 0.0 {
-            (cpu_delta / system_delta) * num_cpus * 100.0
-        } else {
-            0.0
+        // Memory as `docker stats` shows it: without the page cache the
+        // kernel can drop.
+        let usage = stats.memory_stats.usage.unwrap_or(0);
+        let inactive_file = match stats.memory_stats.stats {
+            Some(bollard::container::MemoryStatsStats::V1(v1)) => v1.total_inactive_file,
+            Some(bollard::container::MemoryStatsStats::V2(v2)) => v2.inactive_file,
+            None => 0,
+        };
+        let block_io = |op: &str| -> u64 {
+            stats
+                .blkio_stats
+                .io_service_bytes_recursive
+                .iter()
+                .flatten()
+                .filter(|e| e.op.eq_ignore_ascii_case(op))
+                .map(|e| e.value)
+                .sum()
         };
 
         Ok(ContainerStats {
             container_id: id.to_string(),
             cpu_percent,
-            memory_usage_bytes: stats.memory_stats.usage.unwrap_or(0),
+            memory_usage_bytes: usage.saturating_sub(inactive_file),
             memory_limit_bytes: stats.memory_stats.limit.unwrap_or(0),
             network_rx_bytes: stats
                 .networks
@@ -229,8 +278,8 @@ impl ContainerRuntime for BollardRuntime {
                 .as_ref()
                 .map(|n| n.values().map(|v| v.tx_bytes).sum())
                 .unwrap_or(0),
-            block_read_bytes: 0, // TODO: parse blkio stats
-            block_write_bytes: 0,
+            block_read_bytes: block_io("read"),
+            block_write_bytes: block_io("write"),
         })
     }
 
@@ -265,6 +314,7 @@ impl ContainerRuntime for BollardRuntime {
         };
 
         self.docker.update_container(id, config).await?;
+        self.forget_containers();
         Ok(())
     }
 
@@ -273,6 +323,7 @@ impl ContainerRuntime for BollardRuntime {
         self.docker
             .rename_container(id, RenameContainerOptions { name: new_name })
             .await?;
+        self.forget_containers();
         Ok(())
     }
 
@@ -339,6 +390,31 @@ impl ContainerRuntime for BollardRuntime {
             exit_code: inspect.exit_code.unwrap_or(-1) as i32,
             output: collected,
         })
+    }
+}
+
+impl BollardRuntime {
+    /// Stats for every running container in one call, cached briefly (see
+    /// `STATS_TTL`) so several views polling at once cost one round.
+    pub async fn all_container_stats(&self) -> anyhow::Result<Vec<ContainerStats>> {
+        self.stats
+            .get(false, || async {
+                let running = self.list_containers(false).await?;
+                // Forget CPU readings of containers that stopped.
+                self.cpu_samples
+                    .lock()
+                    .unwrap()
+                    .retain(|id, _| running.iter().any(|c| &c.id == id));
+                let stats = futures_util::future::join_all(
+                    running
+                        .iter()
+                        .filter(|c| c.state == ContainerState::Running)
+                        .map(|c| self.container_stats(&c.id)),
+                )
+                .await;
+                anyhow::Ok(stats.into_iter().filter_map(Result::ok).collect())
+            })
+            .await
     }
 }
 
