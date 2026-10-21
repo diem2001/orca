@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use kube::Client;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
@@ -16,6 +18,8 @@ use serde::Serialize;
 
 use orca_core::config::KubernetesRuntime;
 use orca_core::kubernetes::*;
+
+use crate::TtlCache;
 
 /// Build the `INSTALL_K3S_EXEC` server arguments for the chosen runtime.
 /// Docker runtime adds `--docker`, which makes k3s use cri-dockerd so locally
@@ -262,12 +266,54 @@ fn extract_all_yaml_kinds(yaml: &str) -> anyhow::Result<Vec<Option<String>>> {
     Ok(kinds)
 }
 
+/// How long a computed [`ClusterStatus`] is reused. The Kubernetes page polls
+/// it every 5 s, as do other pages and the agent.
+const STATUS_TTL: Duration = Duration::from_secs(5);
+
+/// How long the "is k3s/kubectl installed" probe is reused. It spawns
+/// processes (`wsl.exe` on Windows) and only matters while K8s isn't set up.
+const INSTALLED_TTL: Duration = Duration::from_secs(60);
+
+/// How long the Traefik service and ingress hostnames shown on the gateway
+/// page are reused.
+const TRAEFIK_TTL: Duration = Duration::from_secs(30);
+
+/// How long a missing metrics API (k3s runs with `--disable=metrics-server`)
+/// is remembered before asking again.
+const METRICS_MISSING_TTL: Duration = Duration::from_secs(60);
+
+/// The Traefik service and the ingress hostnames, see
+/// [`K3sManager::traefik_overview`].
+pub type TraefikOverview = (Option<TraefikServiceInfo>, Vec<IngressHostEntry>);
+
+/// A kubeconfig file's path, size and mtime.
+type KubeconfigStamp = (PathBuf, u64, SystemTime);
+
 /// k3s-based Kubernetes manager.
 pub struct K3sManager {
     /// Override kubeconfig path (if None, uses default k3s location).
     kubeconfig_override: Option<PathBuf>,
     /// Cached kube client (re-created on failure).
     client: tokio::sync::Mutex<Option<Client>>,
+    status: TtlCache<ClusterStatus>,
+    installed: TtlCache<bool>,
+    traefik: TtlCache<TraefikOverview>,
+    /// Whether the kubeconfig has our context, for the file at this path,
+    /// size and mtime, so polls don't re-read it.
+    orca_context: std::sync::Mutex<Option<(KubeconfigStamp, bool)>>,
+    /// Until when the metrics API is known to be missing.
+    metrics_missing_until: std::sync::Mutex<Option<Instant>>,
+}
+
+/// Drops the cached status and install probe when it goes out of scope, so
+/// whatever an enable/disable/start/reset did shows up on the next poll.
+struct ForgetStatus<'a>(&'a K3sManager);
+
+impl Drop for ForgetStatus<'_> {
+    fn drop(&mut self) {
+        self.0.status.forget();
+        self.0.installed.forget();
+    }
 }
 
 impl Default for K3sManager {
@@ -278,19 +324,33 @@ impl Default for K3sManager {
 
 impl K3sManager {
     pub fn new() -> Self {
-        Self {
-            kubeconfig_override: None,
-            client: tokio::sync::Mutex::new(None),
-        }
+        Self::build(None)
     }
 
     /// Create a K3sManager that uses a specific kubeconfig file.
     /// Useful for k3d clusters and testing.
     pub fn with_kubeconfig(path: PathBuf) -> Self {
+        Self::build(Some(path))
+    }
+
+    fn build(kubeconfig_override: Option<PathBuf>) -> Self {
         Self {
-            kubeconfig_override: Some(path),
+            kubeconfig_override,
             client: tokio::sync::Mutex::new(None),
+            status: TtlCache::new(STATUS_TTL),
+            installed: TtlCache::new(INSTALLED_TTL),
+            traefik: TtlCache::new(TRAEFIK_TTL),
+            orca_context: std::sync::Mutex::new(None),
+            metrics_missing_until: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Forget the cached status now and again when the guard drops. Held
+    /// across operations that change the cluster's state.
+    fn forget_status(&self) -> ForgetStatus<'_> {
+        self.status.forget();
+        self.installed.forget();
+        ForgetStatus(self)
     }
 
     /// Create from KUBECONFIG environment variable, falling back to default.
@@ -307,28 +367,29 @@ impl K3sManager {
         self.kubeconfig_path()
     }
 
-    /// Find the kubectl binary — prefer `k3s kubectl`, fall back to `kubectl`.
-    /// Returns (binary, optional prefix args) so callers can use Command::new safely.
-    fn kubectl_bin(&self) -> String {
-        // Check for k3s first (direct install)
-        if std::process::Command::new("k3s")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return "k3s kubectl".to_string();
+    /// Whether a `k3s` binary is on PATH (direct install), so kubectl is run
+    /// as `k3s kubectl`. Looked up on PATH rather than by spawning
+    /// `k3s --version`, which blocked a runtime worker on every kubectl call.
+    /// A hit is remembered; a miss is looked up again, since k3s can be
+    /// installed while the daemon runs.
+    fn k3s_on_path() -> bool {
+        static FOUND: AtomicBool = AtomicBool::new(false);
+        if FOUND.load(Ordering::Relaxed) {
+            return true;
         }
-        "kubectl".to_string()
+        let exe = if cfg!(target_os = "windows") { "k3s.exe" } else { "k3s" };
+        let found = std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()));
+        if found {
+            FOUND.store(true, Ordering::Relaxed);
+        }
+        found
     }
 
-    /// Build a Command for kubectl, handling the "k3s kubectl" case properly.
+    /// Build a Command for kubectl, preferring `k3s kubectl` over `kubectl`.
     /// Always uses --context orca to avoid connecting to the user's remote clusters.
     fn kubectl_command(&self) -> Command {
-        let bin = self.kubectl_bin();
-
-        if bin.starts_with("k3s ") {
+        if Self::k3s_on_path() {
             let mut c = Command::new("k3s");
             c.arg("kubectl");
             c
@@ -409,22 +470,29 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Check if our "orca" context exists in the kubeconfig
+    /// Check if our "orca" context exists in the kubeconfig. The answer is
+    /// kept until the file's size or mtime changes.
     fn has_orca_context(&self) -> bool {
         let path = self.kubeconfig_path();
-        if !path.exists() {
+        let Ok(meta) = std::fs::metadata(&path) else {
             return false;
-        }
+        };
         let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
         // k3s.yaml is always ours (direct install, not yet merged)
         if filename == "k3s.yaml" {
             return true;
         }
-        // Check for our "orca" context in the kubeconfig
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            return contents.contains("name: orca");
+        let stamp = meta.modified().ok().map(|mtime| (path.clone(), meta.len(), mtime));
+        let mut cached = self.orca_context.lock().unwrap();
+        if let (Some(stamp), Some((seen, has))) = (&stamp, cached.as_ref())
+            && stamp == seen
+        {
+            return *has;
         }
-        false
+        // Check for our "orca" context in the kubeconfig
+        let has = std::fs::read_to_string(&path).is_ok_and(|contents| contents.contains("name: orca"));
+        *cached = stamp.map(|stamp| (stamp, has));
+        has
     }
 
     async fn get_client(&self) -> anyhow::Result<Client> {
@@ -434,7 +502,7 @@ impl K3sManager {
         }
 
         let kubeconfig_path = self.kubeconfig_path();
-        tracing::info!("K8s get_client: loading kubeconfig from {}", kubeconfig_path.display());
+        tracing::debug!("K8s get_client: loading kubeconfig from {}", kubeconfig_path.display());
         if !kubeconfig_path.exists() {
             anyhow::bail!("Kubernetes not enabled — no kubeconfig found");
         }
@@ -507,7 +575,7 @@ impl K3sManager {
                 let node_name = parts.first().unwrap_or(&"").to_string();
                 let ready = parts.get(1).map(|s| *s == "True").unwrap_or(false);
                 let version = parts.get(2).unwrap_or(&"").to_string();
-                tracing::info!("K8s via kubectl CLI: node={node_name}, ready={ready}, version={version}");
+                tracing::debug!("K8s via kubectl CLI: node={node_name}, ready={ready}, version={version}");
 
                 // Get pod counts
                 let mut pod_cmd = self.kubectl_command();
@@ -555,16 +623,16 @@ impl K3sManager {
         })
     }
 
+    /// Whether k3s is installed (natively, or inside WSL2 on Windows).
+    ///
+    /// This used to also accept any `kubectl` (`kubectl version --client
+    /// --short`). kubectl 1.28 removed `--short`, so that probe has failed
+    /// everywhere since; and when it did pass, a stray kubectl made `enable`
+    /// skip installing k3s and the UI offer "Start" for a cluster that
+    /// doesn't exist. Other clusters are found through the kubeconfig.
     async fn is_k3s_installed(&self) -> bool {
         // Try native k3s first
-        if Command::new("k3s")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success())
-        {
+        if Self::k3s_on_path() {
             return true;
         }
         // On Windows, check inside WSL2
@@ -581,15 +649,19 @@ impl K3sManager {
                 return true;
             }
         }
-        // Also check if kubectl is available (works for any k8s install)
-        Command::new("kubectl")
-            .arg("version")
-            .args(["--client", "--short"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success())
+        false
+    }
+
+    /// [`is_k3s_installed`](Self::is_k3s_installed), reused for
+    /// [`INSTALLED_TTL`], for the status poll.
+    async fn is_k3s_installed_cached(&self) -> bool {
+        let installed = self
+            .installed
+            .get(false, || async {
+                Ok::<_, std::convert::Infallible>(self.is_k3s_installed().await)
+            })
+            .await;
+        installed.unwrap_or_else(|never| match never {})
     }
 
     async fn install_k3s(&self, runtime: KubernetesRuntime) -> anyhow::Result<()> {
@@ -614,6 +686,7 @@ impl K3sManager {
 
     /// Enable k3s with step-by-step progress log returned as a string.
     pub async fn enable_with_progress(&self, runtime: KubernetesRuntime) -> anyhow::Result<String> {
+        let _forget = self.forget_status();
         let mut log = String::new();
 
         // Platform check
@@ -749,6 +822,7 @@ impl K3sManager {
         tx: tokio::sync::mpsc::Sender<String>,
     ) -> anyhow::Result<()> {
         use crate::environment::run_cmd_streaming;
+        let _forget = self.forget_status();
 
         let send = |msg: String| {
             let tx = tx.clone();
@@ -1156,8 +1230,225 @@ impl K3sManager {
     }
 }
 
+impl K3sManager {
+    async fn compute_status(&self) -> anyhow::Result<ClusterStatus> {
+        // On Windows, k3s runs inside WSL — always check via WSL directly
+        // The Windows-side kubeconfig may not exist or may not be usable
+        #[cfg(target_os = "windows")]
+        {
+            let installed = self.is_k3s_installed_cached().await;
+            if !installed {
+                return Ok(ClusterStatus {
+                    enabled: false,
+                    running: false,
+                    installed: false,
+                    version: None,
+                    node_name: None,
+                    node_status: None,
+                    pods_running: 0,
+                    pods_total: 0,
+                    traefik_dashboard: None,
+                    error: None,
+                });
+            }
+            tracing::debug!("K8s status: checking via WSL kubectl...");
+
+            if let Ok(output) = Command::new("wsl")
+                .args(["-u", "root", "--", "k3s", "kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name},{.items[0].status.conditions[?(@.type==\"Ready\")].status},{range .items[0].status.nodeInfo}{.kubeletVersion}{end}"])
+                .output()
+                .await
+            {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !text.is_empty() && output.status.success() {
+                    let parts: Vec<&str> = text.split(',').collect();
+                    let wsl_node_name = parts.first().unwrap_or(&"").to_string();
+                    let wsl_ready = parts.get(1).map(|s| *s == "True").unwrap_or(false);
+                    let wsl_version = parts.get(2).unwrap_or(&"").to_string();
+                    tracing::debug!("K8s via WSL: node={}, ready={}, version={}", wsl_node_name, wsl_ready, wsl_version);
+
+                    // Get pod counts
+                    let (pods_r, pods_t) = if let Ok(pod_out) = Command::new("wsl")
+                        .args(["-u", "root", "--", "k3s", "kubectl", "get", "pods", "-A", "--no-headers"])
+                        .output()
+                        .await
+                    {
+                        let pod_text = String::from_utf8_lossy(&pod_out.stdout);
+                        (pod_text.lines().filter(|l| l.contains("Running")).count() as u32,
+                         pod_text.lines().count() as u32)
+                    } else { (0, 0) };
+
+                    return Ok(ClusterStatus {
+                        enabled: true,
+                        running: wsl_ready,
+                        installed: true,
+                        version: if wsl_version.is_empty() { None } else { Some(wsl_version) },
+                        node_name: if wsl_node_name.is_empty() { None } else { Some(wsl_node_name) },
+                        node_status: if wsl_ready { Some("Ready".to_string()) } else { Some("NotReady".to_string()) },
+                        pods_running: pods_r,
+                        pods_total: pods_t,
+                        traefik_dashboard: None, // Not accessible from Windows (WSL2 port forwarding)
+                        error: None,
+                    });
+                }
+            }
+            // WSL kubectl failed — k3s installed but not running
+            return Ok(ClusterStatus {
+                enabled: true,
+                running: false,
+                installed: true,
+                version: None,
+                node_name: None,
+                node_status: None,
+                pods_running: 0,
+                pods_total: 0,
+                traefik_dashboard: None,
+                error: None,
+            });
+        }
+
+        // Non-Windows: check kubeconfig, then use the kube client directly
+        #[cfg(not(target_os = "windows"))]
+        {
+            let kubeconfig_path = self.kubeconfig_path();
+            let has_context = self.has_orca_context();
+            tracing::debug!(
+                "K8s status: kubeconfig={}, has_orca_context={}",
+                kubeconfig_path.display(),
+                has_context
+            );
+
+            if !kubeconfig_path.exists() || !has_context {
+                let installed = self.is_k3s_installed_cached().await;
+                tracing::debug!("K8s status: no kubeconfig found, is_k3s_installed={}", installed);
+                return Ok(ClusterStatus {
+                    enabled: installed,
+                    running: false,
+                    installed,
+                    version: None,
+                    node_name: None,
+                    node_status: None,
+                    pods_running: 0,
+                    pods_total: 0,
+                    traefik_dashboard: None,
+                    error: if installed {
+                        None
+                    } else {
+                        Some(format!("Kubeconfig not found at {}", kubeconfig_path.display()))
+                    },
+                });
+            }
+
+            let client = match self.get_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("K8s status: kube client failed ({e}), trying kubectl CLI fallback");
+                    return self.status_via_kubectl().await;
+                }
+            };
+
+            let version = match client.apiserver_version().await {
+                Ok(ver) => Some(format!("v{}.{}", ver.major, ver.minor)),
+                Err(e) => {
+                    tracing::debug!("K8s status: API server not reachable: {e}");
+                    None
+                }
+            };
+            let running = version.is_some();
+
+            let ((node_name, node_status), (pods_running, pods_total)) = if running {
+                tokio::join!(Self::node_summary(&client), Self::pod_counts(&client))
+            } else {
+                ((None, None), (0, 0))
+            };
+
+            Ok(ClusterStatus {
+                enabled: true,
+                running,
+                installed: true,
+                version,
+                node_name,
+                node_status,
+                pods_running,
+                pods_total,
+                traefik_dashboard: if running {
+                    Some("http://127.0.0.1:9000/dashboard/".to_string())
+                } else {
+                    None
+                },
+                error: if !running {
+                    Some("Kubernetes API server not reachable".to_string())
+                } else {
+                    None
+                },
+            })
+        }
+    }
+
+    /// Whether the metrics API was found missing less than
+    /// [`METRICS_MISSING_TTL`] ago.
+    fn metrics_known_missing(&self) -> bool {
+        self.metrics_missing_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn mark_metrics_missing(&self) {
+        *self.metrics_missing_until.lock().unwrap() = Some(Instant::now() + METRICS_MISSING_TTL);
+    }
+
+    /// Name and readiness of the (first) node.
+    #[cfg(not(target_os = "windows"))]
+    async fn node_summary(client: &Client) -> (Option<String>, Option<String>) {
+        let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
+        nodes
+            .list(&ListParams::default())
+            .await
+            .ok()
+            .and_then(|list| {
+                list.items.first().map(|n| {
+                    let name = n.metadata.name.clone().unwrap_or_default();
+                    let status = n
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_ref())
+                        .and_then(|conds| {
+                            conds.iter().find(|c| c.type_ == "Ready").map(|c| {
+                                if c.status == "True" {
+                                    "Ready".to_string()
+                                } else {
+                                    "NotReady".to_string()
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    (name, status)
+                })
+            })
+            .map(|(n, s)| (Some(n), Some(s)))
+            .unwrap_or((None, None))
+    }
+
+    /// (running, total) pods across all namespaces. Lists metadata only,
+    /// letting the API server pick out the running ones, rather than
+    /// fetching every pod's full spec and status.
+    #[cfg(not(target_os = "windows"))]
+    async fn pod_counts(client: &Client) -> (u32, u32) {
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::all(client.clone());
+        let (all, running) = (
+            ListParams::default(),
+            ListParams::default().fields("status.phase=Running"),
+        );
+        match tokio::join!(pods.list_metadata(&running), pods.list_metadata(&all)) {
+            (Ok(r), Ok(t)) => (r.items.len() as u32, t.items.len() as u32),
+            _ => (0, 0),
+        }
+    }
+}
+
 impl K8sManager for K3sManager {
     async fn enable(&self, runtime: KubernetesRuntime) -> anyhow::Result<()> {
+        let _forget = self.forget_status();
         if !self.is_k3s_installed().await {
             self.install_k3s(runtime).await?;
         }
@@ -1197,6 +1488,7 @@ impl K8sManager for K3sManager {
     }
 
     async fn disable(&self) -> anyhow::Result<()> {
+        let _forget = self.forget_status();
         #[cfg(target_os = "windows")]
         {
             // Smart stop: use systemctl if available, otherwise pkill directly
@@ -1322,6 +1614,7 @@ impl K8sManager for K3sManager {
     }
 
     async fn start(&self, runtime: KubernetesRuntime) -> anyhow::Result<()> {
+        let _forget = self.forget_status();
         if !self.is_k3s_installed().await {
             anyhow::bail!("k3s is not installed — use Enable to install it first");
         }
@@ -1356,6 +1649,7 @@ impl K8sManager for K3sManager {
     }
 
     async fn reset(&self, runtime: KubernetesRuntime) -> anyhow::Result<()> {
+        let _forget = self.forget_status();
         self.disable().await?;
 
         // k3s-uninstall.sh removes everything
@@ -1372,210 +1666,10 @@ impl K8sManager for K3sManager {
         self.enable(runtime).await
     }
 
+    /// Cluster status, reused for [`STATUS_TTL`]; concurrent callers share one
+    /// computation. Enable/disable/start/reset drop it.
     async fn status(&self) -> anyhow::Result<ClusterStatus> {
-        // On Windows, k3s runs inside WSL — always check via WSL directly
-        // The Windows-side kubeconfig may not exist or may not be usable
-        #[cfg(target_os = "windows")]
-        {
-            let installed = self.is_k3s_installed().await;
-            if !installed {
-                return Ok(ClusterStatus {
-                    enabled: false,
-                    running: false,
-                    installed: false,
-                    version: None,
-                    node_name: None,
-                    node_status: None,
-                    pods_running: 0,
-                    pods_total: 0,
-                    traefik_dashboard: None,
-                    error: None,
-                });
-            }
-            tracing::info!("K8s status: checking via WSL kubectl...");
-
-            if let Ok(output) = Command::new("wsl")
-                .args(["-u", "root", "--", "k3s", "kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name},{.items[0].status.conditions[?(@.type==\"Ready\")].status},{range .items[0].status.nodeInfo}{.kubeletVersion}{end}"])
-                .output()
-                .await
-            {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !text.is_empty() && output.status.success() {
-                    let parts: Vec<&str> = text.split(',').collect();
-                    let wsl_node_name = parts.first().unwrap_or(&"").to_string();
-                    let wsl_ready = parts.get(1).map(|s| *s == "True").unwrap_or(false);
-                    let wsl_version = parts.get(2).unwrap_or(&"").to_string();
-                    tracing::info!("K8s via WSL: node={}, ready={}, version={}", wsl_node_name, wsl_ready, wsl_version);
-
-                    // Get pod counts
-                    let (pods_r, pods_t) = if let Ok(pod_out) = Command::new("wsl")
-                        .args(["-u", "root", "--", "k3s", "kubectl", "get", "pods", "-A", "--no-headers"])
-                        .output()
-                        .await
-                    {
-                        let pod_text = String::from_utf8_lossy(&pod_out.stdout);
-                        (pod_text.lines().filter(|l| l.contains("Running")).count() as u32,
-                         pod_text.lines().count() as u32)
-                    } else { (0, 0) };
-
-                    return Ok(ClusterStatus {
-                        enabled: true,
-                        running: wsl_ready,
-                        installed: true,
-                        version: if wsl_version.is_empty() { None } else { Some(wsl_version) },
-                        node_name: if wsl_node_name.is_empty() { None } else { Some(wsl_node_name) },
-                        node_status: if wsl_ready { Some("Ready".to_string()) } else { Some("NotReady".to_string()) },
-                        pods_running: pods_r,
-                        pods_total: pods_t,
-                        traefik_dashboard: None, // Not accessible from Windows (WSL2 port forwarding)
-                        error: None,
-                    });
-                }
-            }
-            // WSL kubectl failed — k3s installed but not running
-            return Ok(ClusterStatus {
-                enabled: true,
-                running: false,
-                installed: true,
-                version: None,
-                node_name: None,
-                node_status: None,
-                pods_running: 0,
-                pods_total: 0,
-                traefik_dashboard: None,
-                error: None,
-            });
-        }
-
-        // Non-Windows: check kubeconfig, then use the kube client directly
-        #[cfg(not(target_os = "windows"))]
-        {
-            let kubeconfig_path = self.kubeconfig_path();
-            let has_context = self.has_orca_context();
-            tracing::info!(
-                "K8s status: kubeconfig={}, has_orca_context={}",
-                kubeconfig_path.display(),
-                has_context
-            );
-
-            if !kubeconfig_path.exists() || !has_context {
-                let installed = self.is_k3s_installed().await;
-                tracing::info!("K8s status: no kubeconfig found, is_k3s_installed={}", installed);
-                return Ok(ClusterStatus {
-                    enabled: installed,
-                    running: false,
-                    installed,
-                    version: None,
-                    node_name: None,
-                    node_status: None,
-                    pods_running: 0,
-                    pods_total: 0,
-                    traefik_dashboard: None,
-                    error: if installed {
-                        None
-                    } else {
-                        Some(format!("Kubeconfig not found at {}", kubeconfig_path.display()))
-                    },
-                });
-            }
-
-            let client = match self.get_client().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("K8s status: kube client failed ({e}), trying kubectl CLI fallback");
-                    return self.status_via_kubectl().await;
-                }
-            };
-
-            let api_result = client.apiserver_version().await;
-            let running = api_result.is_ok();
-            match &api_result {
-                Ok(ver) => tracing::info!("K8s status: API server reachable, version {}.{}", ver.major, ver.minor),
-                Err(e) => tracing::info!("K8s status: API server not reachable: {e}"),
-            }
-
-            let version = if running {
-                client
-                    .apiserver_version()
-                    .await
-                    .ok()
-                    .map(|v| format!("v{}.{}", v.major, v.minor))
-            } else {
-                None
-            };
-
-            let (node_name, node_status) = if running {
-                let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
-                nodes
-                    .list(&ListParams::default())
-                    .await
-                    .ok()
-                    .and_then(|list| {
-                        list.items.first().map(|n| {
-                            let name = n.metadata.name.clone().unwrap_or_default();
-                            let status = n
-                                .status
-                                .as_ref()
-                                .and_then(|s| s.conditions.as_ref())
-                                .and_then(|conds| {
-                                    conds.iter().find(|c| c.type_ == "Ready").map(|c| {
-                                        if c.status == "True" {
-                                            "Ready".to_string()
-                                        } else {
-                                            "NotReady".to_string()
-                                        }
-                                    })
-                                })
-                                .unwrap_or_else(|| "Unknown".to_string());
-                            (name, status)
-                        })
-                    })
-                    .map(|(n, s)| (Some(n), Some(s)))
-                    .unwrap_or((None, None))
-            } else {
-                (None, None)
-            };
-
-            let (pods_running, pods_total) = if running {
-                let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::all(client.clone());
-                pods.list(&ListParams::default())
-                    .await
-                    .ok()
-                    .map(|list| {
-                        let total = list.items.len() as u32;
-                        let r = list
-                            .items
-                            .iter()
-                            .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
-                            .count() as u32;
-                        (r, total)
-                    })
-                    .unwrap_or((0, 0))
-            } else {
-                (0, 0)
-            };
-
-            Ok(ClusterStatus {
-                enabled: true,
-                running,
-                installed: true,
-                version,
-                node_name,
-                node_status,
-                pods_running,
-                pods_total,
-                traefik_dashboard: if running {
-                    Some("http://127.0.0.1:9000/dashboard/".to_string())
-                } else {
-                    None
-                },
-                error: if !running {
-                    Some("Kubernetes API server not reachable".to_string())
-                } else {
-                    None
-                },
-            })
-        }
+        self.status.get(false, || self.compute_status()).await
     }
 
     async fn kubeconfig(&self) -> anyhow::Result<String> {
@@ -2746,10 +2840,14 @@ impl K8sManager for K3sManager {
 
     async fn list_pod_metrics(&self, namespace: &str) -> anyhow::Result<Vec<PodMetrics>> {
         validate_k8s_name(namespace)?;
+        if self.metrics_known_missing() {
+            return Ok(vec![]);
+        }
+
         // kubectl top does NOT support -o json, so we parse text output
         #[cfg(target_os = "windows")]
-        let output = {
-            Command::new("wsl")
+        {
+            let output = Command::new("wsl")
                 .args([
                     "-u",
                     "root",
@@ -2763,49 +2861,72 @@ impl K8sManager for K3sManager {
                     "--no-headers",
                 ])
                 .output()
-                .await?
-        };
+                .await?;
 
-        #[cfg(not(target_os = "windows"))]
-        let output = {
-            self.kubectl_command()
-                .args(["top", "pods", "-n", namespace, "--no-headers"])
-                .env("KUBECONFIG", self.kubeconfig_path())
-                .output()
-                .await?
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Metrics server not installed is a common case, return empty
-            if stderr.contains("Metrics API not available")
-                || stderr.contains("metrics")
-                || stderr.contains("not found")
-            {
-                return Ok(vec![]);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("Metrics API not available") {
+                    self.mark_metrics_missing();
+                }
+                // Metrics server not installed is a common case, return empty
+                if stderr.contains("Metrics API not available")
+                    || stderr.contains("metrics")
+                    || stderr.contains("not found")
+                {
+                    return Ok(vec![]);
+                }
+                anyhow::bail!("kubectl top pods failed: {stderr}");
             }
-            anyhow::bail!("kubectl top pods failed: {stderr}");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let metrics: Vec<PodMetrics> = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        Some(PodMetrics {
+                            name: parts[0].to_string(),
+                            cpu: parts[1].to_string(),
+                            memory: parts[2].to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            return Ok(metrics);
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let metrics: Vec<PodMetrics> = stdout
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    Some(PodMetrics {
-                        name: parts[0].to_string(),
-                        cpu: parts[1].to_string(),
-                        memory: parts[2].to_string(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // The metrics API that `kubectl top` reads, through the cached client
+        // instead of spawning kubectl.
+        #[cfg(not(target_os = "windows"))]
+        {
+            use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 
-        Ok(metrics)
+            let client = self.get_client().await?;
+            let resource = ApiResource::from_gvk_with_plural(
+                &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics"),
+                "pods",
+            );
+            let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &resource);
+            let list = match api.list(&ListParams::default()).await {
+                Ok(list) => list,
+                // Metrics server not installed (404), or registered but
+                // unavailable (503) — a common case, return empty
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 503 => {
+                    self.mark_metrics_missing();
+                    return Ok(vec![]);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            Ok(list
+                .items
+                .iter()
+                .map(|m| pod_metrics_from_api(m.metadata.name.clone().unwrap_or_default(), &m.data))
+                .collect())
+        }
     }
 
     async fn rollout_history(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<RolloutRevision>> {
@@ -4495,25 +4616,55 @@ impl K3sManager {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
+    /// The Traefik service and all ingress hostnames, as the gateway page
+    /// shows them, reused for [`TRAEFIK_TTL`]. Errors read as "no Traefik" and
+    /// "no hostnames".
+    pub async fn traefik_overview(&self) -> TraefikOverview {
+        let overview = self
+            .traefik
+            .get(false, || async {
+                let (info, hostnames) =
+                    tokio::join!(self.get_traefik_service_info(), self.list_all_ingress_hostnames());
+                Ok::<_, std::convert::Infallible>((info.ok().flatten(), hostnames.unwrap_or_default()))
+            })
+            .await;
+        overview.unwrap_or_else(|never| match never {})
+    }
+
     /// Get information about the Traefik service in kube-system.
     pub async fn get_traefik_service_info(&self) -> anyhow::Result<Option<TraefikServiceInfo>> {
-        let output = self
-            .kubectl_command()
-            .args(["get", "svc", "traefik", "-n", "kube-system", "-o", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
+        #[cfg(target_os = "windows")]
+        let svc: serde_json::Value = {
+            let output = self
+                .kubectl_command()
+                .args(["get", "svc", "traefik", "-n", "kube-system", "-o", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("NotFound") || stderr.contains("not found") {
-                return Ok(None);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("NotFound") || stderr.contains("not found") {
+                    return Ok(None);
+                }
+                anyhow::bail!("kubectl get svc traefik failed: {stderr}");
             }
-            anyhow::bail!("kubectl get svc traefik failed: {stderr}");
-        }
 
-        let svc: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            serde_json::from_slice(&output.stdout)?
+        };
+
+        // Through the cached client; serialized back to the JSON kubectl
+        // would print, so both paths share the parsing below.
+        #[cfg(not(target_os = "windows"))]
+        let svc: serde_json::Value = {
+            let client = self.get_client().await?;
+            let api: Api<k8s_openapi::api::core::v1::Service> = Api::namespaced(client, "kube-system");
+            match api.get_opt("traefik").await? {
+                Some(svc) => serde_json::to_value(svc)?,
+                None => return Ok(None),
+            }
+        };
         let spec = svc.get("spec").cloned().unwrap_or_default();
 
         let service_type = spec
@@ -4602,6 +4753,7 @@ impl K3sManager {
             .output()
             .await?;
 
+        self.traefik.forget();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("Failed to patch Traefik service: {stderr}");
@@ -4612,24 +4764,35 @@ impl K3sManager {
 
     /// List all hostnames from Ingress resources across all namespaces.
     pub async fn list_all_ingress_hostnames(&self) -> anyhow::Result<Vec<IngressHostEntry>> {
-        let output = self
-            .kubectl_command()
-            .args(["get", "ingress", "-A", "-o", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
+        #[cfg(target_os = "windows")]
+        let list: serde_json::Value = {
+            let output = self
+                .kubectl_command()
+                .args(["get", "ingress", "-A", "-o", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // No ingresses is not an error
-            if stderr.contains("No resources found") {
-                return Ok(Vec::new());
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // No ingresses is not an error
+                if stderr.contains("No resources found") {
+                    return Ok(Vec::new());
+                }
+                anyhow::bail!("Failed to list ingresses: {stderr}");
             }
-            anyhow::bail!("Failed to list ingresses: {stderr}");
-        }
 
-        let list: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            serde_json::from_slice(&output.stdout)?
+        };
+
+        // Through the cached client, as JSON like kubectl's (see above).
+        #[cfg(not(target_os = "windows"))]
+        let list: serde_json::Value = {
+            let client = self.get_client().await?;
+            let api: Api<k8s_openapi::api::networking::v1::Ingress> = Api::all(client);
+            serde_json::to_value(api.list(&ListParams::default()).await?)?
+        };
         let items = list.get("items").and_then(|v| v.as_array());
 
         let mut entries = Vec::new();
@@ -4693,6 +4856,71 @@ spec:
 }
 
 // --- Helper functions ---
+
+/// A `metrics.k8s.io` PodMetrics' container usage summed and formatted the
+/// way `kubectl top pods` prints it: CPU in whole millicores, memory in whole
+/// MiB, each rounded as kubectl rounds them.
+fn pod_metrics_from_api(name: String, data: &serde_json::Value) -> PodMetrics {
+    let (mut cpu, mut memory) = (0i128, 0i128);
+    for c in data["containers"].as_array().into_iter().flatten() {
+        let usage = &c["usage"];
+        cpu += usage["cpu"].as_str().and_then(quantity_nanos).unwrap_or(0);
+        memory += usage["memory"].as_str().and_then(quantity_nanos).unwrap_or(0);
+    }
+    PodMetrics {
+        name,
+        cpu: format!("{}m", ceil_div(cpu, 1_000_000)),
+        memory: format!("{}Mi", ceil_div(memory, 1_000_000_000) / (1024 * 1024)),
+    }
+}
+
+/// A Kubernetes resource quantity ("250m", "1.5", "128974848", "64Ki",
+/// "1e3") in billionths of its unit, rounded up. None if it doesn't parse.
+fn quantity_nanos(q: &str) -> Option<i128> {
+    let q = q.trim();
+    let split = q
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '+' || c == '-'))
+        .unwrap_or(q.len());
+    let (number, suffix) = q.split_at(split);
+    let (int, frac) = number.split_once('.').unwrap_or((number, ""));
+    let mantissa: i128 = format!("{int}{frac}").parse().ok()?;
+    let frac_scale = 10i128.checked_pow(frac.len() as u32)?;
+
+    const N: i128 = 1_000_000_000;
+    let (mul, div) = match suffix {
+        "n" => (1, 1),
+        "u" => (1_000, 1),
+        "m" => (1_000_000, 1),
+        "" => (N, 1),
+        "k" => (N * 1_000, 1),
+        "M" => (N * 1_000_000, 1),
+        "G" => (N * 1_000_000_000, 1),
+        "T" => (N * 1_000_000_000_000, 1),
+        "P" => (N * 1_000_000_000_000_000, 1),
+        "E" => (N * 1_000_000_000_000_000_000, 1),
+        "Ki" => (N << 10, 1),
+        "Mi" => (N << 20, 1),
+        "Gi" => (N << 30, 1),
+        "Ti" => (N << 40, 1),
+        "Pi" => (N << 50, 1),
+        "Ei" => (N << 60, 1),
+        _ => {
+            let exp: i32 = suffix.strip_prefix(['e', 'E'])?.parse().ok()?;
+            let exp = 9 + exp;
+            if exp >= 0 {
+                (10i128.checked_pow(exp as u32)?, 1)
+            } else {
+                (1, 10i128.checked_pow(exp.unsigned_abs())?)
+            }
+        }
+    };
+    Some(ceil_div(mantissa.checked_mul(mul)?, frac_scale.checked_mul(div)?))
+}
+
+/// `n / d` rounded up, for non-negative `n` and positive `d`.
+fn ceil_div(n: i128, d: i128) -> i128 {
+    (n + d - 1) / d
+}
 
 fn k8s_pod_to_pod(p: &k8s_openapi::api::core::v1::Pod, namespace: &str) -> Pod {
     let status = p.status.as_ref();
@@ -4869,4 +5097,64 @@ fn format_duration_since(start: &str) -> String {
         return String::new();
     };
     format_chrono_duration(chrono::Utc::now().signed_duration_since(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantities_parse_to_nanos() {
+        assert_eq!(quantity_nanos("250m"), Some(250_000_000));
+        assert_eq!(quantity_nanos("1234567n"), Some(1_234_567));
+        assert_eq!(quantity_nanos("12u"), Some(12_000));
+        assert_eq!(quantity_nanos("1.5"), Some(1_500_000_000));
+        assert_eq!(quantity_nanos("2"), Some(2_000_000_000));
+        assert_eq!(quantity_nanos("64Ki"), Some(64 * 1024 * 1_000_000_000));
+        assert_eq!(quantity_nanos("1Gi"), Some((1 << 30) * 1_000_000_000));
+        assert_eq!(quantity_nanos("3k"), Some(3_000 * 1_000_000_000));
+        assert_eq!(quantity_nanos("1e3"), Some(1_000 * 1_000_000_000));
+        assert_eq!(quantity_nanos("5e-9"), Some(5));
+        assert_eq!(quantity_nanos("0.0000000001"), Some(1)); // rounded up
+        assert_eq!(quantity_nanos("12Q"), None);
+        assert_eq!(quantity_nanos(""), None);
+    }
+
+    #[test]
+    fn pod_metrics_match_kubectl_top() {
+        // Two containers: 1.2m + 3.5m CPU = 4.7m, which kubectl prints as 5m;
+        // 10Mi + 512Ki memory = 10.5Mi, which kubectl prints as 10Mi.
+        let data = serde_json::json!({
+            "containers": [
+                { "name": "a", "usage": { "cpu": "1200000n", "memory": "10240Ki" } },
+                { "name": "b", "usage": { "cpu": "3500u", "memory": "524288" } }
+            ]
+        });
+        let m = pod_metrics_from_api("web-1".into(), &data);
+        assert_eq!(m.name, "web-1");
+        assert_eq!(m.cpu, "5m");
+        assert_eq!(m.memory, "10Mi");
+
+        let empty = pod_metrics_from_api("idle".into(), &serde_json::json!({}));
+        assert_eq!((empty.cpu.as_str(), empty.memory.as_str()), ("0m", "0Mi"));
+    }
+
+    #[test]
+    fn orca_context_is_cached_until_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("orca-k8s-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        std::fs::write(&path, "contexts:\n- name: other\n").unwrap();
+        let m = K3sManager::with_kubeconfig(path.clone());
+        assert!(!m.has_orca_context());
+        assert!(!m.has_orca_context());
+
+        // A different size invalidates even within the mtime's granularity.
+        std::fs::write(&path, "contexts:\n- name: other\n- name: orca\n").unwrap();
+        assert!(m.has_orca_context());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(!m.has_orca_context());
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
