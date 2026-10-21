@@ -11,6 +11,7 @@ import YamlEditor from "../components/YamlEditor";
 import Dropdown from "../components/Dropdown";
 import CopyButton from "../components/CopyButton";
 import K8sTerminal from "../components/K8sTerminal";
+import VirtualLogList from "../components/VirtualLogList";
 import type {
   ClusterStatus,
   Pod,
@@ -3682,26 +3683,25 @@ spec:
                 }}>Close</button>
               </div>
             </div>
-            <div ref={logContainerRef} class="selectable" style={{
-              flex: "1",
-              overflow: "auto",
-              padding: "12px 16px",
-              "font-family": "'JetBrains Mono', 'Fira Code', monospace",
-              "font-size": "12px",
-              "line-height": "1.6",
-              color: "#c9d1d9",
-              "white-space": "pre-wrap",
-              "word-break": "break-all",
-            }}>
-              <Show
-                when={logLines().length > 0}
-                fallback={<span style={{ color: "#8b949e" }}>No log output</span>}
-              >
-                <For each={logLines()}>
-                  {(line) => <div>{line}</div>}
-                </For>
-              </Show>
-            </div>
+            {/* Virtualized: a following tail grows to 5,000 lines. Rows are
+                keyed by index since each poll replaces the whole list. */}
+            <VirtualLogList
+              ref={logContainerRef}
+              class="selectable"
+              style={{
+                flex: "1",
+                padding: "12px 16px",
+                "font-family": "'JetBrains Mono', 'Fira Code', monospace",
+                color: "#c9d1d9",
+              }}
+              keys={logLines().map((_, i) => i)}
+              textLength={(i) => logLines()[i]?.length ?? 0}
+              fontSize={12}
+              lineHeight={1.6}
+              follow={logFollow()}
+              empty={<span style={{ color: "#8b949e" }}>No log output</span>}
+              renderRow={(i) => <div class="log-line">{logLines()[i]}</div>}
+            />
           </div>
         </div>
       </Show>

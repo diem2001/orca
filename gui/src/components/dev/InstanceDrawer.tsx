@@ -1,5 +1,5 @@
 // Instance detail: everything about one worktree's instance, in tabs.
-import { createSignal, createEffect, For, Show, onCleanup, on } from "solid-js";
+import { createSignal, createEffect, createMemo, For, Show, onCleanup, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import Dropdown from "../Dropdown";
@@ -287,18 +287,30 @@ function Logs(props: { project: DevProject; inst: DevInstance }) {
     for (const c of svc) h = (h * 31 + c.charCodeAt(0)) >>> 0;
     return colors[h % colors.length];
   };
-  const lines = () =>
-    text()
+  // Memoized (it used to be re-parsed for each of its two readers), and
+  // unchanged lines reuse their row object from the previous poll so <For>
+  // keeps their DOM nodes instead of rebuilding every row.
+  type Row = { svc: string; ts: string; msg: string };
+  let prevRows = new Map<string, Row>();
+  const lines = createMemo(() => {
+    const rows = new Map<string, Row>();
+    const parsed = text()
       .split("\n")
       .filter((l) => l.length > 0)
-      .map((l) => {
-        const m = l.match(/^(\S+)\s+\|\s?(\S+)?\s?(.*)$/);
-        if (!m) return { svc: "", ts: "", msg: l };
-        return { svc: m[1].replace(/-\d+$/, ""), ts: m[2] ?? "", msg: m[3] ?? "" };
+      .map((l, i) => {
+        let row = prevRows.get(l);
+        if (!row) {
+          const m = l.match(/^(\S+)\s+\|\s?(\S+)?\s?(.*)$/);
+          row = m ? { svc: m[1].replace(/-\d+$/, ""), ts: m[2] ?? "", msg: m[3] ?? "" } : { svc: "", ts: "", msg: l };
+        }
+        rows.set(l, row);
+        return { row, i };
       })
       // compose prints each service's lines as a block; interleave by time.
-      .map((l, i) => ({ ...l, i }))
-      .sort((a, b) => (a.ts && b.ts && a.ts !== b.ts ? (a.ts < b.ts ? -1 : 1) : a.i - b.i));
+      .sort((a, b) => (a.row.ts && b.row.ts && a.row.ts !== b.row.ts ? (a.row.ts < b.row.ts ? -1 : 1) : a.i - b.i));
+    prevRows = rows;
+    return parsed.map((p) => p.row);
+  });
 
   return (
     <>
