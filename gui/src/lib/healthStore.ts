@@ -1,5 +1,6 @@
 import { batch, createSignal, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { startPoller, type Poller } from "./poller";
 import type { SystemHealth } from "./types";
 
 // One `system_health` poll for the whole app. The Titlebar, StatusBar,
@@ -12,7 +13,7 @@ const [health, setHealth] = createSignal<SystemHealth | null>(null);
 const [healthError, setHealthError] = createSignal<string | null>(null);
 
 let subscribers = 0;
-let timer: ReturnType<typeof setInterval> | null = null;
+let poller: Poller | null = null;
 let inflight: Promise<void> | null = null;
 
 function fetchHealth(refresh: boolean): Promise<void> {
@@ -44,15 +45,12 @@ export function refreshHealth(opts?: { recomputeDisk?: boolean }): Promise<void>
 export function useHealth() {
   onMount(() => {
     subscribers++;
-    if (!timer) {
-      refreshHealth();
-      timer = setInterval(() => refreshHealth(), POLL_MS);
-    }
+    if (!poller) poller = startPoller(() => refreshHealth(), POLL_MS);
     onCleanup(() => {
       subscribers--;
-      if (subscribers === 0 && timer) {
-        clearInterval(timer);
-        timer = null;
+      if (subscribers === 0 && poller) {
+        poller.stop();
+        poller = null;
       }
     });
   });

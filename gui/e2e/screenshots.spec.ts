@@ -58,6 +58,7 @@ async function injectTauriBridge(page: Page) {
               });
               return lines;
             }),
+          all_container_stats: () => fetchJson(DAEMON +"/containers/stats"),
           start_container: () => Promise.resolve({}),
           stop_container: () => Promise.resolve({}),
           inspect_container: () => fetchJson(DAEMON +"/containers/" + args.id),

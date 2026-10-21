@@ -1,12 +1,15 @@
-import { createSignal, createEffect, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createEffect, on, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import type { Container, ContainerStats, Image, ComposeProject, SystemHealth, GatewayStatus, GatewayRoute } from "../lib/types";
+import type { ContainerStats, SystemHealth, GatewayStatus, GatewayRoute } from "../lib/types";
 import { useRefresh } from "../lib/useRefresh";
+import { usePoller } from "../lib/poller";
+import { containersStore, imagesStore, stacksStore } from "../lib/dockerStore";
 import { useHealth, refreshHealth } from "../lib/healthStore";
 import { devApi } from "../lib/dev";
 import type { DevProject } from "../lib/dev";
 import { formatBytes } from "../lib/format";
-import { recordMetrics, getDashboardCpuHistory, getDashboardMemHistory, getPerContainerCpuChartHistory, getPerContainerMemChartHistory } from "../lib/metricsStore";
+import { getDashboardCpuHistory, getDashboardMemHistory, getCpuChartHistory, getMemChartHistory } from "../lib/metricsStore";
+import { useContainerStats } from "../lib/statsStore";
 
 import TimeChart from "../components/TimeChart";
 import LastUpdated from "../components/LastUpdated";
@@ -28,20 +31,24 @@ interface DashboardPageProps {
 }
 
 export default function DashboardPage(props: DashboardPageProps) {
-  const [containers, setContainers] = createSignal<Container[]>([]);
-  const [images, setImages] = createSignal<Image[]>([]);
-  const [stacks, setStacks] = createSignal<ComposeProject[]>([]);
+  // Containers, images and stacks come from the shared lists (refreshed by
+  // Docker events); gateway, dev projects and stats are polled here.
+  const containerList = containersStore.use();
+  const imageList = imagesStore.use();
+  const stackList = stacksStore.use();
+  const containers = containerList.list;
+  const images = imageList.list;
+  const stacks = stackList.list;
   const [health, setHealth] = createSignal<SystemHealth | null>(null);
-  const [containerStats, setContainerStats] = createSignal<Record<string, ContainerStats>>({});
-  const [lastUpdated, setLastUpdated] = createSignal<Date | null>(null);
+  const lastUpdated = () => {
+    const t = containerList.updatedAt();
+    return t ? new Date(t) : null;
+  };
 
   const [gatewayStatus, setGatewayStatus] = createSignal<GatewayStatus | null>(null);
   const [gatewayRoutes, setGatewayRoutes] = createSignal<GatewayRoute[]>([]);
   const [devProjects, setDevProjects] = createSignal<DevProject[] | null>(null);
 
-  const [containersState, setContainersState] = createSignal<CardState>("loading");
-  const [imagesState, setImagesState] = createSignal<CardState>("loading");
-  const [stacksState, setStacksState] = createSignal<CardState>("loading");
   const [healthState, setHealthState] = createSignal<CardState>("loading");
   const [containersError, setContainersError] = createSignal("");
   const [imagesError, setImagesError] = createSignal("");
@@ -66,43 +73,41 @@ export default function DashboardPage(props: DashboardPageProps) {
     return e;
   };
 
-  const fetchAll = () => {
-    // Each card fetches independently — no waiting for the others
-    // Don't log connection errors to Activity (they're transient during startup)
-    invokeWithTimeout<Container[]>("list_containers")
-      .then((v) => { setContainers(v || []); setContainersState("ready"); connectionFailCount = 0; })
-      .catch((e) => { setContainersError(friendlyError(String(e))); setContainersState("error"); })
-      .finally(() => setLastUpdated(new Date()));
+  const cardState = (list: { error: () => string | null; loaded: () => boolean }): CardState =>
+    list.error() ? "error" : list.loaded() ? "ready" : "loading";
+  const containersState = () => cardState(containerList);
+  const imagesState = () => cardState(imageList);
+  const stacksState = () => cardState(stackList);
+  createEffect(on(containerList.error, (e) => {
+    if (e) setContainersError(friendlyError(e));
+    else connectionFailCount = 0;
+  }));
+  createEffect(on(imageList.error, (e) => { if (e) setImagesError(friendlyError(e)); }));
+  createEffect(on(stackList.error, (e) => { if (e) setStacksError(friendlyError(e)); }));
 
-    invokeWithTimeout<Image[]>("list_images")
-      .then((v) => { setImages(v || []); setImagesState("ready"); })
-      .catch((e) => { setImagesError(friendlyError(String(e))); setImagesState("error"); });
-
-    invokeWithTimeout<ComposeProject[]>("list_stacks")
-      .then((v) => { setStacks(v || []); setStacksState("ready"); })
-      .catch((e) => { setStacksError(friendlyError(String(e))); setStacksState("error"); });
-
-    invokeWithTimeout<GatewayStatus>("gateway_status")
-      .then((v) => {
-        setGatewayStatus(v);
-        if (v?.running) {
-          invokeWithTimeout<GatewayRoute[]>("gateway_list_routes")
-            .then((r) => setGatewayRoutes(r || []))
-            .catch(() => setGatewayRoutes([]));
-        } else {
-          setGatewayRoutes([]);
-        }
-      })
-      .catch(() => { setGatewayStatus(null); setGatewayRoutes([]); });
+  const fetchGateway = async () => {
+    try {
+      const v = await invokeWithTimeout<GatewayStatus>("gateway_status");
+      setGatewayStatus(v);
+      setGatewayRoutes(v?.running ? (await invokeWithTimeout<GatewayRoute[]>("gateway_list_routes")) || [] : []);
+    } catch {
+      setGatewayStatus(null);
+      setGatewayRoutes([]);
+    }
   };
+  const gatewayPoller = usePoller(fetchGateway, 5000);
 
-  // A manual refresh (Ctrl+R) also fetches health now instead of waiting for its poll.
+  // A manual refresh (Ctrl+R) fetches everything now instead of waiting for the polls.
   useRefresh(() => {
-    fetchAll();
+    containerList.refresh();
+    imageList.refresh();
+    stackList.refresh();
+    gatewayPoller.now();
+    refreshStats();
     refreshHealth();
   });
 
-  // Health comes from the app-wide poll, not from the 5-second refresh above.
+  // Health comes from the app-wide poll.
   const shared = useHealth();
   createEffect(() => {
     const h = shared.health();
@@ -116,25 +121,17 @@ export default function DashboardPage(props: DashboardPageProps) {
     }
   });
 
-  // Reset page-local state when switching hosts.
+  // Reset page-local state when switching hosts (the shared lists reset themselves).
   // NOTE: clearAllMetrics() is NOT called here — the metricsStore module
   // registers its own `orca-host-switch` listener so metrics are cleared
   // even when the Dashboard isn't mounted.
   const handleHostSwitch = () => {
-    setContainerStats({});
-    setContainersState("loading");
-    setImagesState("loading");
-    setStacksState("loading");
     setHealthState("loading");
-    fetchAll();
+    gatewayPoller.now();
   };
   // Worktree instances: a quick view of what's running per project.
   const loadProjects = () => devApi.listProjects(false).then(setDevProjects).catch(() => setDevProjects([]));
-  onMount(() => {
-    loadProjects();
-    const t = setInterval(loadProjects, 10000);
-    onCleanup(() => clearInterval(t));
-  });
+  usePoller(loadProjects, 10000);
   const devRunning = () =>
     (devProjects() ?? []).flatMap((p) => p.instances ?? []).filter((i) => i.status === "running" || i.status === "partial").length;
   const devTotal = () => (devProjects() ?? []).reduce((n, p) => n + (p.instances ?? []).length, 0);
@@ -155,53 +152,8 @@ export default function DashboardPage(props: DashboardPageProps) {
     });
   });
 
-  const fetchStats = async () => {
-    const running = containers().filter((c) => c.state === "Running");
-    if (running.length === 0) return;
-    const results = await Promise.allSettled(
-      running.map((c) => invokeWithTimeout<ContainerStats>("container_stats", { id: c.id }))
-    );
-    const newStats: Record<string, ContainerStats> = {};
-    results.forEach((r, i) => {
-      if (r.status === "fulfilled") {
-        const s = r.value;
-        newStats[running[i].id] = s;
-        recordMetrics(running[i].id, {
-          timestamp: Date.now(),
-          cpu: s.cpu_percent,
-          memory: s.memory_usage_bytes,
-          memoryLimit: s.memory_limit_bytes,
-          networkRx: s.network_rx_bytes,
-          networkTx: s.network_tx_bytes,
-        }, running[i].name);
-      }
-    });
-    setContainerStats(newStats);
-  };
-
-  onMount(() => {
-    let disposed = false;
-    fetchAll();
-    // Stats depend on containers being loaded; kick off after a short delay.
-    const initialStatsTimer = setTimeout(() => {
-      if (!disposed) fetchStats();
-    }, 2000);
-    // NOTE: Dashboard is authoritative for the 5-second refresh here. We
-    // intentionally do NOT also subscribe via useRefresh — the `useRefresh`
-    // call above would otherwise fire a second round of the same requests
-    // on every global refresh event. If you want a manual refresh button,
-    // dispatch `orca-refresh` and let this interval tick pick it up.
-    const interval = setInterval(() => {
-      if (disposed) return;
-      fetchAll();
-      fetchStats();
-    }, 5000);
-    onCleanup(() => {
-      disposed = true;
-      clearTimeout(initialStatsTimer);
-      clearInterval(interval);
-    });
-  });
+  // Stats of all running containers, shared with the containers table.
+  const { stats: containerStats, refresh: refreshStats } = useContainerStats();
 
   const runningCount = () => containers().filter((c) => c.state === "Running").length;
   const totalImageSize = () => images().reduce((sum, img) => sum + img.size_bytes, 0);
@@ -523,7 +475,7 @@ export default function DashboardPage(props: DashboardPageProps) {
                       </td>
                       <td>
                         <TimeChart
-                          data={getPerContainerCpuChartHistory()[item.container.id] || []}
+                          data={getCpuChartHistory(item.container.id)}
                           height={40}
                           color="#58a6ff"
                           fillColor="#58a6ff"
@@ -570,7 +522,7 @@ export default function DashboardPage(props: DashboardPageProps) {
                       </td>
                       <td>
                         <TimeChart
-                          data={getPerContainerMemChartHistory()[item.container.id] || []}
+                          data={getMemChartHistory(item.container.id)}
                           height={40}
                           color="#3fb950"
                           fillColor="#3fb950"

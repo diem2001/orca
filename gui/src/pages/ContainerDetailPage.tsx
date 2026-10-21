@@ -1,7 +1,9 @@
-import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
+import { createSignal, createEffect, onMount, Show, For } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { Container, ContainerStats } from "../lib/types";
 import { useRefresh } from "../lib/useRefresh";
+import { usePoller } from "../lib/poller";
+import { containersStore } from "../lib/dockerStore";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { showToast } from "../components/Toast";
 import { confirmDanger } from "../components/ConfirmDialog";
@@ -78,16 +80,15 @@ export default function ContainerDetailPage(props: ContainerDetailPageProps) {
   const [renaming, setRenaming] = createSignal(false);
   const [renameValue, setRenameValue] = createSignal("");
 
-  let statsInterval: ReturnType<typeof setInterval> | undefined;
 
-  const fetchContainer = async () => {
-    try {
-      const containers = (await invoke("list_containers")) as Container[];
-      const c = containers.find((x) => x.id === props.containerId);
-      if (c) setContainer(c);
-    } catch {
-    }
-  };
+  // The container comes from the shared list (refreshed by Docker events);
+  // keep the last one seen in case it disappears.
+  const containerList = containersStore.use();
+  createEffect(() => {
+    const c = containerList.list().find((x) => x.id === props.containerId);
+    if (c) setContainer({ ...c });
+  });
+  const fetchContainer = () => containerList.refresh();
 
   useRefresh(fetchContainer);
 
@@ -117,63 +118,20 @@ export default function ContainerDetailPage(props: ContainerDetailPageProps) {
     }
   };
 
-  const startStatsRefresh = () => {
-    stopStatsRefresh();
-    fetchStats();
-    statsInterval = setInterval(fetchStats, 3000);
-  };
+  // Stats only while the overview tab shows a running container.
+  usePoller(() => {
+    if (activeTab() === "overview" && container()?.state === "Running") return fetchStats();
+  }, 3000);
 
-  const stopStatsRefresh = () => {
-    if (statsInterval) {
-      clearInterval(statsInterval);
-      statsInterval = undefined;
-    }
-  };
-
-  onMount(() => {
-    let interval: ReturnType<typeof setInterval> | undefined;
-    let disposed = false;
-
-    // Register cleanup SYNCHRONOUSLY so the await-chain below can't
-    // detach us from Solid's reactive owner. Previously this was placed
-    // after `await Promise.all(...)` and would register against the
-    // wrong owner on fast unmounts, leaking intervals forever.
-    onCleanup(() => {
-      disposed = true;
-      if (interval) clearInterval(interval);
-      stopStatsRefresh();
-    });
-
-    (async () => {
-      setLoading(true);
-      await Promise.all([fetchContainer(), fetchInspect()]);
-      if (disposed) return;
-      setLoading(false);
-
-      if (container()?.state === "Running") {
-        startStatsRefresh();
-      }
-
-      interval = setInterval(async () => {
-        if (disposed) return;
-        await fetchContainer();
-        const cur = container();
-        if (cur?.state === "Running" && !statsInterval) {
-          startStatsRefresh();
-        } else if (cur?.state !== "Running" && statsInterval) {
-          stopStatsRefresh();
-        }
-      }, 3000);
-    })();
+  onMount(async () => {
+    setLoading(true);
+    await fetchInspect();
+    setLoading(false);
   });
 
   const switchTab = (tab: DetailTab) => {
     setActiveTab(tab);
-    if (tab === "overview" && container()?.state === "Running") {
-      startStatsRefresh();
-    } else if (tab !== "overview") {
-      stopStatsRefresh();
-    }
+    if (tab === "overview" && container()?.state === "Running") void fetchStats();
 
     if (tab === "resources") {
       initResourceFields();

@@ -4,6 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import { showToast } from "../components/Toast";
 import { useRefresh } from "../lib/useRefresh";
+import { usePoller } from "../lib/poller";
+import { appVisible } from "../lib/visibility";
 import { confirmDanger } from "../components/ConfirmDialog";
 import { logError, logInfo } from "../lib/activityStore";
 import Spinner from "../components/Spinner";
@@ -385,16 +387,17 @@ export default function KubernetesPage() {
     }
   };
 
+  // Status and workloads together, never overlapping: an unreachable
+  // cluster can take longer than the interval to answer.
+  let pollCount = 0;
+  usePoller(async () => {
+    await Promise.all([refreshStatus(), pollCount++ > 0 ? refreshWorkloads() : undefined]);
+  }, 5000);
+
   onMount(() => {
     document.addEventListener("click", handleDocClick);
-    refreshStatus();
     refreshPortForwards();
-    const interval = setInterval(() => {
-      refreshStatus();
-      refreshWorkloads();
-    }, 5000);
     onCleanup(() => {
-      clearInterval(interval);
       document.removeEventListener("click", handleDocClick);
       // Ensure the log-follow poll loop stops if the user navigates away
       // while it's active — previously this interval kept polling forever.
@@ -3666,7 +3669,7 @@ spec:
                           showToast("Pod no longer available — stopped following logs", "info");
                         }
                       };
-                      logFollowInterval = setInterval(poll, 2000);
+                      logFollowInterval = setInterval(() => { if (appVisible()) void poll(); }, 2000);
                     } else {
                       if (logFollowInterval) { clearInterval(logFollowInterval); logFollowInterval = null; }
                     }

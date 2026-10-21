@@ -9,6 +9,7 @@ import { DATA_MODE_LABEL, STATUS_META, ago, bytes, devApi, followJob, instanceUr
 import type { DataInfo, DataMode, DevInstance, DevJob, DevProject, PlanView } from "../../lib/dev";
 import { confirm, confirmDanger } from "../ConfirmDialog";
 import { DataModePicker, JobSteps, StatusDot, YamlView } from "./DevBits";
+import { usePoller } from "../../lib/poller";
 
 type Tab = "overview" | "logs" | "env" | "data" | "override" | "settings";
 
@@ -278,8 +279,7 @@ function Logs(props: { project: DevProject; inst: DevInstance }) {
     }
   };
   createEffect(on(service, load));
-  const timer = setInterval(() => follow() && load(), 2500);
-  onCleanup(() => clearInterval(timer));
+  usePoller(() => follow() && load(), 2500, { immediate: false });
 
   const colors = ["#79c0ff", "#7ee787", "#d2a8ff", "#ffa657", "#ff7b72", "#a5d6ff", "#f2cc60"];
   const colorFor = (svc: string) => {

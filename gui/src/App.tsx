@@ -35,6 +35,7 @@ import AiAssistant from "./components/AiAssistant";
 import type { AiAssistantApi } from "./components/AiAssistant";
 import type { EnvironmentStatus } from "./lib/types";
 import KeyboardShortcuts from "./components/KeyboardShortcuts";
+import { startPoller, type Poller } from "./lib/poller";
 
 export type Page = "fleet" | "dashboard" | "projects" | "templates" | "containers" | "container-detail" | "stack-detail" | "images" | "builds" | "volumes" | "volume-detail" | "networks" | "gateway" | "kubernetes" | "environment" | "activity" | "settings";
 
@@ -61,7 +62,7 @@ export default function App() {
   // Fleet health polling state
   const lastFleetStatus: Record<string, boolean> = {};
   const fleetStatusCount: Record<string, number> = {};
-  let fleetPollInterval: ReturnType<typeof setInterval> | null = null;
+  let fleetPoller: Poller | null = null;
 
   const pollFleetHealth = async () => {
     try {
@@ -345,9 +346,9 @@ export default function App() {
     // First-time startup side-effects
     if (!environmentChecked()) {
       checkEnvironment();
-      if (!fleetPollInterval) {
+      if (!fleetPoller) {
         setTimeout(pollFleetHealth, 10000);
-        fleetPollInterval = setInterval(pollFleetHealth, 60000);
+        fleetPoller = startPoller(pollFleetHealth, 60000, { immediate: false });
       }
     }
 
@@ -461,8 +462,14 @@ export default function App() {
           const status = (await invoke("get_status")) as any;
           if (status.daemon_running) {
             setStartupStep("Connecting to Docker...");
-            // On Windows, Docker in WSL might need a reconnect
-            try { await invoke("reconnect_runtime"); } catch {}
+            // Reconnect only if the daemon has no working connection (e.g.
+            // Docker in WSL on Windows came up after it). A reconnect swaps
+            // the runtime, which restarts its event stream and empties its
+            // caches, so don't do it on every launch.
+            try {
+              const health = (await invoke("system_health")) as any;
+              if (!health?.docker_connected) await invoke("reconnect_runtime");
+            } catch {}
             setDaemonStatus("running");
             return;
           }
@@ -474,17 +481,17 @@ export default function App() {
     };
     startAndWait();
 
-    const interval = setInterval(() => {
-      if (daemonStatus() !== "connecting") watchDaemon();
-    }, 3000);
+    const watchdog = startPoller(() => {
+      if (daemonStatus() !== "connecting") return watchDaemon();
+    }, 3000, { immediate: false });
 
     document.addEventListener("keydown", handleGlobalKeyDown);
     const openCmdPalette = () => setShowCommandPalette((v) => !v);
     document.addEventListener("orca-open-command-palette", openCmdPalette);
     onCleanup(() => {
       unmounted = true;
-      clearInterval(interval);
-      if (fleetPollInterval) clearInterval(fleetPollInterval);
+      watchdog.stop();
+      fleetPoller?.stop();
       document.removeEventListener("keydown", handleGlobalKeyDown);
       document.removeEventListener("orca-open-command-palette", openCmdPalette);
       unsubEvents();

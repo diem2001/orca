@@ -5,6 +5,7 @@ import { formatBytes } from "../lib/format";
 import { confirmDanger } from "../components/ConfirmDialog";
 import { showToast } from "../components/Toast";
 import type { RemoteHost, HostStatus } from "../lib/types";
+import { usePoller } from "../lib/poller";
 
 // Module-level signal — persists across navigation
 const [lastSeen, setLastSeen] = createSignal<Record<string, number>>({});
@@ -301,11 +302,7 @@ export default function FleetPage(props: FleetPageProps) {
 
   useRefresh(probeAll);
 
-  onMount(() => {
-    probeAll();
-    const interval = setInterval(probeAll, 30000);
-    onCleanup(() => clearInterval(interval));
-  });
+  usePoller(probeAll, 30000);
 
   const handleCardClick = async (host: HostStatus, e: MouseEvent) => {
     if (selectMode()) {

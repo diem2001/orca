@@ -82,12 +82,13 @@ export default function StatusBar(props: StatusBarProps) {
     const t = setTimeout(checkUpdate, 5000);
     const updateInterval = setInterval(checkUpdate, 3600000);
     getVersion().then((v) => { if (!disposed) setAppVersion(v); }).catch(() => {});
-    const interval = setInterval(pollActiveHost, 15000);
+    // The active host only changes through a host switch.
+    document.addEventListener("orca-host-switch", pollActiveHost);
     onCleanup(() => {
       disposed = true;
       clearTimeout(t);
-      clearInterval(interval);
       clearInterval(updateInterval);
+      document.removeEventListener("orca-host-switch", pollActiveHost);
     });
   });
 

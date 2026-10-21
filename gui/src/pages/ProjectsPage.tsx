@@ -1,11 +1,12 @@
 // Projects: run every worktree of a repo as its own instance, with
 // infrastructure shared. The page is organised the way the system is:
 // shared services on top, one card per worktree below.
-import { createSignal, createMemo, For, Show, onMount, onCleanup } from "solid-js";
+import { createSignal, createMemo, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { showToast } from "../components/Toast";
 import { confirm, confirmDanger } from "../components/ConfirmDialog";
 import { useRefresh } from "../lib/useRefresh";
+import { usePoller } from "../lib/poller";
 import { DATA_MODE_LABEL, devApi, followJob, tildify } from "../lib/dev";
 import type { Candidate, DataMode, DevInstance, DevJob, DevProject } from "../lib/dev";
 import InstanceCard from "../components/dev/InstanceCard";
@@ -91,9 +92,7 @@ export default function ProjectsPage(props: Props) {
     }
   };
 
-  onMount(refresh);
-  const timer = setInterval(refresh, 4000);
-  onCleanup(() => clearInterval(timer));
+  usePoller(refresh, 5000);
   useRefresh(refresh);
 
   /** Follow a job, keeping the card's progress live; toast the outcome. */

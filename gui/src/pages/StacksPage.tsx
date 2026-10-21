@@ -1,6 +1,6 @@
-import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import type { ComposeProject } from "../lib/types";
+import { stacksStore } from "../lib/dockerStore";
 import { formatPorts } from "../lib/format";
 import { showToast } from "../components/Toast";
 import { confirmDanger } from "../components/ConfirmDialog";
@@ -14,7 +14,9 @@ interface StacksPageProps {
 }
 
 export default function StacksPage(props: StacksPageProps) {
-  const [stacks, setStacks] = createSignal<ComposeProject[]>([]);
+  // Shared list, refreshed by Docker events (see lib/dockerStore.ts).
+  const stackList = stacksStore.use();
+  const stacks = stackList.list;
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
   const [loading, setLoading] = createSignal<string | null>(null);
   const [composeOutput, setComposeOutput] = createSignal<{
@@ -26,7 +28,10 @@ export default function StacksPage(props: StacksPageProps) {
     name: string;
   } | null>(null);
   const [serviceLoading, setServiceLoading] = createSignal<string | null>(null);
-  const [lastUpdated, setLastUpdated] = createSignal<Date | null>(null);
+  const lastUpdated = () => {
+    const t = stackList.updatedAt();
+    return t ? new Date(t) : null;
+  };
 
   const restartService = async (containerId: string) => {
     setServiceLoading(containerId);
@@ -42,20 +47,7 @@ export default function StacksPage(props: StacksPageProps) {
     setServiceLoading(null);
   };
 
-  const refresh = async () => {
-    try {
-      const result = (await invoke("list_stacks")) as ComposeProject[];
-      setStacks(result);
-      setLastUpdated(new Date());
-    } catch {
-    }
-  };
-
-  onMount(() => {
-    refresh();
-    const interval = setInterval(refresh, 3000);
-    onCleanup(() => clearInterval(interval));
-  });
+  const refresh = () => stackList.refresh();
 
   const toggleExpand = (name: string) => {
     const next = new Set(expanded());

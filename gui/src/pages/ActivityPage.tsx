@@ -1,7 +1,8 @@
-import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
+import { createSignal, For, Show, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getEvents, clearEvents, markAllRead } from "../lib/activityStore";
 import type { ActivityEvent } from "../lib/activityStore";
+import { usePoller } from "../lib/poller";
 
 function relativeTime(date: Date): string {
   const now = Date.now();
@@ -57,10 +58,8 @@ export default function ActivityPage() {
 
   onMount(() => {
     markAllRead();
-    fetchDaemonLog();
-    const interval = setInterval(fetchDaemonLog, 5000);
-    onCleanup(() => clearInterval(interval));
   });
+  usePoller(fetchDaemonLog, 5000);
 
   return (
     <div style={{ display: "flex", "flex-direction": "column", height: "100%" }}>

@@ -1,7 +1,8 @@
-import { createSignal, onMount, onCleanup, For, Show, JSX } from "solid-js";
+import { createSignal, createEffect, on, onMount, onCleanup, For, Show, JSX } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { Page } from "../App";
 import type { RemoteHost } from "../lib/types";
+import { containersStore, imagesStore } from "../lib/dockerStore";
 
 interface SidebarProps {
   currentPage: string;
@@ -156,36 +157,29 @@ const [collapsed, setCollapsed] = createSignal(
 );
 
 export default function Sidebar(props: SidebarProps) {
-  const [containerCount, setContainerCount] = createSignal(0);
-  const [imageCount, setImageCount] = createSignal(0);
+  // Counts come from the shared lists; this component doesn't poll them itself.
+  const containerList = containersStore.use().list;
+  const imageList = imagesStore.use().list;
+  const containerCount = () => containerList().length;
+  const imageCount = () => imageList().length;
   const [hasRemoteHosts, setHasRemoteHosts] = createSignal(false);
 
-  const fetchCounts = async () => {
-    try {
-      const containers = (await invoke("list_containers")) as any[];
-      setContainerCount(containers.length);
-    } catch { /* ignore */ }
-    try {
-      const images = (await invoke("list_images")) as any[];
-      setImageCount(images.length);
-    } catch { /* ignore */ }
+  // Remote hosts only change in Settings or on the Fleet page: re-read them
+  // on navigation and refresh instead of polling.
+  const loadRemoteHosts = async () => {
     try {
       const remotes = (await invoke("list_remote_hosts")) as RemoteHost[];
       setHasRemoteHosts(remotes.length > 0);
     } catch { /* ignore */ }
   };
+  createEffect(on(() => props.currentPage, loadRemoteHosts));
 
   onMount(() => {
-    fetchCounts();
-    const interval = setInterval(fetchCounts, 5000);
-    // Refresh immediately when switching hosts
-    const onHostSwitch = () => fetchCounts();
-    document.addEventListener("orca-host-switch", onHostSwitch);
-    document.addEventListener("orca-refresh", onHostSwitch);
+    document.addEventListener("orca-host-switch", loadRemoteHosts);
+    document.addEventListener("orca-refresh", loadRemoteHosts);
     onCleanup(() => {
-      clearInterval(interval);
-      document.removeEventListener("orca-host-switch", onHostSwitch);
-      document.removeEventListener("orca-refresh", onHostSwitch);
+      document.removeEventListener("orca-host-switch", loadRemoteHosts);
+      document.removeEventListener("orca-refresh", loadRemoteHosts);
     });
   });
 

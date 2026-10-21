@@ -1,4 +1,5 @@
 import { createSignal, onCleanup, onMount } from "solid-js";
+import { appVisible } from "../lib/visibility";
 
 interface LastUpdatedProps {
   timestamp: Date | null;
@@ -18,7 +19,7 @@ export default function LastUpdated(props: LastUpdatedProps) {
   const [now, setNow] = createSignal(Date.now());
 
   onMount(() => {
-    const interval = setInterval(() => setNow(Date.now()), 1000);
+    const interval = setInterval(() => { if (appVisible()) setNow(Date.now()); }, 1000);
     onCleanup(() => clearInterval(interval));
   });
 

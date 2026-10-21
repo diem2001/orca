@@ -1,4 +1,4 @@
-import { createSignal } from "solid-js";
+import { batch, createMemo, createRoot, createSignal, type Accessor, type Setter } from "solid-js";
 import { showToast } from "../components/Toast";
 import { formatBytes } from "./format";
 
@@ -18,7 +18,37 @@ const MAX_POINTS = 60;
 // never opens the Dashboard (which is the only page wiring
 // `pruneMetricsExcept`).
 const STALE_AFTER_MS = 10 * 60 * 1000;
-const [metricsHistory, setMetricsHistory] = createSignal<Record<string, MetricSnapshot[]>>({});
+// One signal per container, so a chart of one container only updates when
+// that container gets a new reading. `ids` changes only when containers come
+// and go; the dashboard's totals read every container.
+type Series = { get: Accessor<MetricSnapshot[]>; set: Setter<MetricSnapshot[]> };
+const series = new Map<string, Series>();
+const [ids, setIds] = createSignal<string[]>([]);
+
+function seriesFor(id: string): Series {
+  let s = series.get(id);
+  if (!s) {
+    const [get, set] = createSignal<MetricSnapshot[]>([]);
+    s = { get, set };
+    series.set(id, s);
+    setIds([...series.keys()]);
+  }
+  return s;
+}
+
+function dropSeries(drop: (id: string) => boolean) {
+  let changed = false;
+  for (const id of [...series.keys()]) {
+    if (!drop(id)) continue;
+    series.delete(id);
+    changed = true;
+    for (const k of Object.keys(lastAlertTime)) {
+      if (k.split(":")[0] === id) delete lastAlertTime[k];
+    }
+    delete highCpuStreak[id];
+  }
+  if (changed) setIds([...series.keys()]);
+}
 
 // --- Resource usage alerts ---
 const MEMORY_THRESHOLD_PERCENT = 90;
@@ -72,49 +102,41 @@ function evaluateAlerts(containerId: string, containerName: string, snapshot: Me
   }
 }
 
-export function recordMetrics(containerId: string, snapshot: MetricSnapshot, containerName?: string) {
+export interface MetricsEntry {
+  id: string;
+  name?: string;
+  snapshot: MetricSnapshot;
+}
+
+/** Record one poll's readings for several containers as a single update. */
+export function recordMetricsBatch(entries: MetricsEntry[]) {
+  // History of a container with no reading for a while (a short-lived
+  // container) is dropped here, so the map stays bounded even when the
+  // Dashboard, which also prunes, is never opened.
   const cutoff = Date.now() - STALE_AFTER_MS;
-  const staleIds: string[] = [];
-  setMetricsHistory((prev) => {
-    // Opportunistically drop history for any container whose most recent
-    // snapshot is older than the staleness window. This covers the case
-    // where a user never visits the Dashboard — otherwise a
-    // MetricSnapshot[] would accumulate per distinct short-lived container
-    // id for the lifetime of the session.
-    const next: Record<string, MetricSnapshot[]> = {};
-    for (const [id, hist] of Object.entries(prev)) {
-      if (id === containerId) continue; // re-added below
-      const lastTs = hist.length > 0 ? hist[hist.length - 1].timestamp : 0;
-      if (lastTs >= cutoff) {
-        next[id] = hist;
-      } else {
-        staleIds.push(id);
-      }
+  const fresh = new Set(entries.map((e) => e.id));
+  batch(() => {
+    dropSeries((id) => {
+      if (fresh.has(id)) return false;
+      const hist = series.get(id)!.get();
+      return hist.length === 0 || hist[hist.length - 1].timestamp < cutoff;
+    });
+    for (const e of entries) {
+      seriesFor(e.id).set((prev) => [...prev, e.snapshot].slice(-MAX_POINTS));
     }
-    const existing = prev[containerId] || [];
-    next[containerId] = [...existing, snapshot].slice(-MAX_POINTS);
-    return next;
   });
+  for (const e of entries) evaluateAlerts(e.id, e.name || e.id.slice(0, 12), e.snapshot);
+}
 
-  // Drop the paired alert-tracking state for any ids we just pruned so
-  // `lastAlertTime` / `highCpuStreak` can't leak after history is gone.
-  if (staleIds.length > 0) {
-    const stale = new Set(staleIds);
-    for (const k of Object.keys(lastAlertTime)) {
-      const id = k.split(":")[0];
-      if (stale.has(id)) delete lastAlertTime[k];
-    }
-    for (const k of Object.keys(highCpuStreak)) {
-      if (stale.has(k)) delete highCpuStreak[k];
-    }
-  }
-
-  // Evaluate resource alerts after recording
-  evaluateAlerts(containerId, containerName || containerId.slice(0, 12), snapshot);
+export function recordMetrics(containerId: string, snapshot: MetricSnapshot, containerName?: string) {
+  recordMetricsBatch([{ id: containerId, name: containerName, snapshot }]);
 }
 
 export function getMetricsHistory(containerId: string): MetricSnapshot[] {
-  return metricsHistory()[containerId] || [];
+  const s = series.get(containerId);
+  if (s) return s.get();
+  ids(); // re-run once this container's history appears
+  return [];
 }
 
 export function getCpuHistory(containerId: string): number[] {
@@ -127,119 +149,45 @@ export function getMemoryHistory(containerId: string): number[] {
   );
 }
 
-export function getAllContainerIds(): string[] {
-  return Object.keys(metricsHistory());
-}
+// --- Chart helpers (return {time, value}[] for TimeChart) ---
 
-export function getAggregatedCpuHistory(): number[] {
-  const history = metricsHistory();
-  const ids = Object.keys(history);
-  if (ids.length === 0) return [];
-
-  const maxLen = Math.max(...ids.map((id) => history[id].length));
-  const result: number[] = [];
-  for (let i = 0; i < maxLen; i++) {
-    let sum = 0;
-    for (const id of ids) {
-      const arr = history[id];
-      const idx = arr.length - maxLen + i;
-      if (idx >= 0) sum += arr[idx].cpu;
-    }
-    result.push(sum);
-  }
-  return result;
-}
-
-export function getAggregatedMemoryHistory(): number[] {
-  const history = metricsHistory();
-  const ids = Object.keys(history);
-  if (ids.length === 0) return [];
-
-  const maxLen = Math.max(...ids.map((id) => history[id].length));
-  const result: number[] = [];
-  for (let i = 0; i < maxLen; i++) {
-    let sum = 0;
-    for (const id of ids) {
-      const arr = history[id];
-      const idx = arr.length - maxLen + i;
-      if (idx >= 0) sum += arr[idx].memory;
-    }
-    result.push(sum);
-  }
-  return result;
-}
-
-// --- Dashboard chart helpers (return {time, value}[] for TimeChart) ---
-
-export function getDashboardCpuHistory(): Array<{ time: number; value: number }> {
-  const history = metricsHistory();
-  const ids = Object.keys(history);
-  if (ids.length === 0) return [];
-
-  const maxLen = Math.max(...ids.map((id) => history[id].length));
-  // Use timestamps from the longest array as reference
-  const longestId = ids.reduce((a, b) => (history[a].length >= history[b].length ? a : b));
-  const refArr = history[longestId];
+/** Sum of one metric over all containers, aligned on the latest readings. */
+function totalHistory(pick: (s: MetricSnapshot) => number): Array<{ time: number; value: number }> {
+  const all = ids().map((id) => series.get(id)?.get() ?? []);
+  if (all.length === 0) return [];
+  const longest = all.reduce((a, b) => (a.length >= b.length ? a : b));
+  const maxLen = longest.length;
   const result: Array<{ time: number; value: number }> = [];
   for (let i = 0; i < maxLen; i++) {
     let sum = 0;
-    for (const id of ids) {
-      const arr = history[id];
+    for (const arr of all) {
       const idx = arr.length - maxLen + i;
-      if (idx >= 0) sum += arr[idx].cpu;
+      if (idx >= 0) sum += pick(arr[idx]);
     }
-    const refIdx = refArr.length - maxLen + i;
-    const time = refIdx >= 0 ? refArr[refIdx].timestamp : Date.now();
-    result.push({ time, value: sum });
+    result.push({ time: longest[i].timestamp, value: sum });
   }
   return result;
 }
 
-export function getDashboardMemHistory(): Array<{ time: number; value: number }> {
-  const history = metricsHistory();
-  const ids = Object.keys(history);
-  if (ids.length === 0) return [];
+// Memoised once for the app, so every reader of the totals shares one pass.
+const totals = createRoot(() => ({
+  cpu: createMemo(() => totalHistory((s) => s.cpu)),
+  memory: createMemo(() => totalHistory((s) => s.memory)),
+}));
 
-  const maxLen = Math.max(...ids.map((id) => history[id].length));
-  const longestId = ids.reduce((a, b) => (history[a].length >= history[b].length ? a : b));
-  const refArr = history[longestId];
-  const result: Array<{ time: number; value: number }> = [];
-  for (let i = 0; i < maxLen; i++) {
-    let sum = 0;
-    for (const id of ids) {
-      const arr = history[id];
-      const idx = arr.length - maxLen + i;
-      if (idx >= 0) sum += arr[idx].memory;
-    }
-    const refIdx = refArr.length - maxLen + i;
-    const time = refIdx >= 0 ? refArr[refIdx].timestamp : Date.now();
-    result.push({ time, value: sum });
-  }
-  return result;
+export const getDashboardCpuHistory = () => totals.cpu();
+export const getDashboardMemHistory = () => totals.memory();
+
+export function getCpuChartHistory(containerId: string): Array<{ time: number; value: number }> {
+  return getMetricsHistory(containerId).map((s) => ({ time: s.timestamp, value: s.cpu }));
 }
 
-export function getPerContainerCpuChartHistory(): Record<string, Array<{ time: number; value: number }>> {
-  const history = metricsHistory();
-  const result: Record<string, Array<{ time: number; value: number }>> = {};
-  for (const [id, snapshots] of Object.entries(history)) {
-    result[id] = snapshots.map((s) => ({ time: s.timestamp, value: s.cpu }));
-  }
-  return result;
-}
-
-export function getPerContainerMemChartHistory(): Record<string, Array<{ time: number; value: number }>> {
-  const history = metricsHistory();
-  const result: Record<string, Array<{ time: number; value: number }>> = {};
-  for (const [id, snapshots] of Object.entries(history)) {
-    result[id] = snapshots.map((s) => ({ time: s.timestamp, value: s.memory }));
-  }
-  return result;
+export function getMemChartHistory(containerId: string): Array<{ time: number; value: number }> {
+  return getMetricsHistory(containerId).map((s) => ({ time: s.timestamp, value: s.memory }));
 }
 
 export function clearAllMetrics() {
-  setMetricsHistory({});
-  for (const k of Object.keys(lastAlertTime)) delete lastAlertTime[k];
-  for (const k of Object.keys(highCpuStreak)) delete highCpuStreak[k];
+  dropSeries(() => true);
 }
 
 // Register a single module-level `orca-host-switch` listener so the
@@ -265,18 +213,5 @@ initHostSwitchListener();
  */
 export function pruneMetricsExcept(liveIds: Iterable<string>) {
   const keep = new Set(liveIds);
-  setMetricsHistory((prev) => {
-    const next: Record<string, MetricSnapshot[]> = {};
-    for (const [id, hist] of Object.entries(prev)) {
-      if (keep.has(id)) next[id] = hist;
-    }
-    return next;
-  });
-  for (const k of Object.keys(lastAlertTime)) {
-    const id = k.split(":")[0];
-    if (!keep.has(id)) delete lastAlertTime[k];
-  }
-  for (const k of Object.keys(highCpuStreak)) {
-    if (!keep.has(k)) delete highCpuStreak[k];
-  }
+  dropSeries((id) => !keep.has(id));
 }

@@ -1,7 +1,9 @@
-import { createSignal, onMount, onCleanup, For, Show, createMemo } from "solid-js";
+import { createSignal, createEffect, on, onMount, onCleanup, For, Show, createMemo } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { Container, ContainerStats, ComposeProject } from "../lib/types";
 import { useRefresh } from "../lib/useRefresh";
+import { usePoller } from "../lib/poller";
+import { containersStore, stacksStore } from "../lib/dockerStore";
 import { formatBytes } from "../lib/format";
 import { showToast } from "../components/Toast";
 import { confirmDanger } from "../components/ConfirmDialog";
@@ -10,7 +12,7 @@ import Spinner from "../components/Spinner";
 import { SkeletonRow } from "../components/Skeleton";
 import ResourceBar from "../components/ResourceBar";
 import LastUpdated from "../components/LastUpdated";
-import { recordMetrics } from "../lib/metricsStore";
+import { useContainerStats } from "../lib/statsStore";
 import { logError } from "../lib/activityStore";
 import MultiLogViewer from "../components/MultiLogViewer";
 import { closeOnEscape } from "../lib/closeOnEscape";
@@ -27,16 +29,23 @@ interface StackGroup {
 }
 
 export default function ContainersPage(props: ContainersPageProps) {
-  const [containers, setContainers] = createSignal<Container[]>([]);
-  const [stacks, setStacks] = createSignal<ComposeProject[]>([]);
+  // Shared lists, refreshed by Docker events (see lib/dockerStore.ts).
+  const containerList = containersStore.use();
+  const stackList = stacksStore.use();
+  const containers = containerList.list;
+  const stacks = stackList.list;
   const [search, setSearch] = createSignal("");
   const [stateFilter, setStateFilter] = createSignal<"all" | "running" | "stopped">("all");
-  const [lastUpdated, setLastUpdated] = createSignal<Date | null>(null);
+  const lastUpdated = () => {
+    const t = containerList.updatedAt();
+    return t ? new Date(t) : null;
+  };
   const [loading, setLoading] = createSignal(false);
   const [actionInProgress, setActionInProgress] = createSignal<string | null>(null);
   const [stackActionInProgress, setStackActionInProgress] = createSignal<string | null>(null);
   const [showRunDialog, setShowRunDialog] = createSignal(false);
-  const [inlineStats, setInlineStats] = createSignal<Record<string, ContainerStats>>({});
+  // Stats of all running containers, shared with the dashboard.
+  const { stats: inlineStats } = useContainerStats();
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set(["__standalone__"]));
   let hasAutoExpanded = false;
   const [menuOpen, setMenuOpen] = createSignal<string | null>(null);
@@ -66,33 +75,32 @@ export default function ContainersPage(props: ContainersPageProps) {
   const [exposeExistingRoutes, setExposeExistingRoutes] = createSignal<Array<{ hostname: string; url: string; port: number }>>([]);
   const [gatewayRoutes, setGatewayRoutes] = createSignal<Array<{ hostname: string; container_name: string; port: number }>>([]);
 
+  const loadGatewayRoutes = () =>
+    invoke("gateway_list_routes").then((r) => setGatewayRoutes((r as any[]) || [])).catch(() => {});
+  usePoller(loadGatewayRoutes, 10_000);
+
   const refresh = async () => {
     try {
-      const [containerResult, stackResult] = await Promise.all([
-        invoke("list_containers") as Promise<Container[]>,
-        invoke("list_stacks") as Promise<ComposeProject[]>,
-      ]);
-      setContainers(containerResult || []);
-      setStacks(stackResult || []);
-      setLastUpdated(new Date());
-      // Fetch gateway routes for hostname badges (non-blocking)
-      invoke("gateway_list_routes").then((r) => setGatewayRoutes((r as any[]) || [])).catch(() => {});
-
-      // Auto-expand stacks with running containers (only on first load)
-      if (!hasAutoExpanded) {
-        hasAutoExpanded = true;
-        const autoExpand = new Set(expanded());
-        for (const stack of stackResult) {
-          if (stack.services.some((s) => s.state === "Running")) {
-            autoExpand.add(stack.name);
-          }
-        }
-        setExpanded(autoExpand);
-      }
-    } catch (e) {
-      logError(`Failed to list containers/stacks: ${e}`);
+      await Promise.all([containerList.refresh(), stackList.refresh()]);
+      const e = containerList.error() ?? stackList.error();
+      if (e) logError(`Failed to list containers/stacks: ${e}`);
+    } finally {
+      loadGatewayRoutes();
     }
   };
+
+  // Auto-expand stacks with running containers (only on first load)
+  createEffect(on(stackList.loaded, (loaded) => {
+    if (!loaded || hasAutoExpanded) return;
+    hasAutoExpanded = true;
+    const autoExpand = new Set(expanded());
+    for (const stack of stacks()) {
+      if (stack.services.some((s) => s.state === "Running")) {
+        autoExpand.add(stack.name);
+      }
+    }
+    setExpanded(autoExpand);
+  }));
 
   useRefresh(refresh);
 
@@ -104,30 +112,6 @@ export default function ContainersPage(props: ContainersPageProps) {
       seen.add(key);
       return true;
     });
-  };
-
-  const fetchAllRunningStats = async () => {
-    const running = containers().filter((c) => c.state === "Running");
-    if (running.length === 0) return;
-    const results = await Promise.allSettled(
-      running.map((c) => invoke("container_stats", { id: c.id }))
-    );
-    const newStats: Record<string, ContainerStats> = { ...inlineStats() };
-    results.forEach((r, i) => {
-      if (r.status === "fulfilled") {
-        const s = r.value as ContainerStats;
-        newStats[running[i].id] = s;
-        recordMetrics(running[i].id, {
-          timestamp: Date.now(),
-          cpu: s.cpu_percent,
-          memory: s.memory_usage_bytes,
-          memoryLimit: s.memory_limit_bytes,
-          networkRx: s.network_rx_bytes,
-          networkTx: s.network_tx_bytes,
-        });
-      }
-    });
-    setInlineStats(newStats);
   };
 
   const suggestHostname = (name: string) => {
@@ -204,15 +188,10 @@ export default function ContainersPage(props: ContainersPageProps) {
     setContainerMenuOpen(null);
   };
 
+
   onMount(() => {
-    refresh().then(fetchAllRunningStats);
-    const interval = setInterval(() => {
-      refresh();
-      fetchAllRunningStats();
-    }, 3000);
     document.addEventListener("click", handleClickOutside);
     onCleanup(() => {
-      clearInterval(interval);
       document.removeEventListener("click", handleClickOutside);
     });
   });

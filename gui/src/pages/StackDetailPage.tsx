@@ -1,6 +1,6 @@
-import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
+import { createSignal, Show, For } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import type { ComposeProject } from "../lib/types";
+import { stacksStore } from "../lib/dockerStore";
 import { useRefresh } from "../lib/useRefresh";
 import { formatPorts } from "../lib/format";
 import { showToast } from "../components/Toast";
@@ -20,7 +20,6 @@ interface StackDetailPageProps {
 type StackTab = "services" | "logs" | "compose";
 
 export default function StackDetailPage(props: StackDetailPageProps) {
-  const [stack, setStack] = createSignal<ComposeProject | null>(null);
   const [activeTab, setActiveTab] = createSignal<StackTab>("services");
   const [actionInProgress, setActionInProgress] = createSignal(false);
   const [serviceLoading, setServiceLoading] = createSignal<string | null>(null);
@@ -29,13 +28,10 @@ export default function StackDetailPage(props: StackDetailPageProps) {
   const [logServiceFilter, setLogServiceFilter] = createSignal<string | null>(null);
   const [savedSinceLastRestart, setSavedSinceLastRestart] = createSignal(false);
 
-  const fetchStack = async () => {
-    try {
-      const result = (await invoke("get_stack", { name: props.stackName })) as ComposeProject;
-      setStack(result);
-    } catch {
-    }
-  };
+  // The stack comes from the shared list, refreshed by Docker events.
+  const stackList = stacksStore.use();
+  const stack = () => stackList.list().find((s) => s.name === props.stackName) ?? null;
+  const fetchStack = () => stackList.refresh();
 
   useRefresh(fetchStack);
 
@@ -49,12 +45,6 @@ export default function StackDetailPage(props: StackDetailPageProps) {
       setComposeContent(null);
     }
   };
-
-  onMount(() => {
-    fetchStack();
-    const interval = setInterval(fetchStack, 3000);
-    onCleanup(() => clearInterval(interval));
-  });
 
   const doStackAction = async (action: string) => {
     setActionInProgress(true);
