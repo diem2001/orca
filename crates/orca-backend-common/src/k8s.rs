@@ -405,6 +405,24 @@ impl K3sManager {
     /// Our context name in ~/.kube/config
     const CONTEXT_NAME: &'static str = "orca";
 
+    /// Build a Command for helm against Orca's cluster: our kubeconfig and,
+    /// unless it's k3s's own single-context file, our context. Without
+    /// `--kube-context` helm used the kubeconfig's current context, often a
+    /// remote cluster the user works with.
+    #[cfg(not(target_os = "windows"))]
+    fn helm_command(&self) -> Command {
+        let mut cmd = Command::new("helm");
+        cmd.env("PATH", Self::extended_path());
+        let path = self.kubeconfig_path();
+        if path.exists() {
+            cmd.env("KUBECONFIG", &path);
+        }
+        if path.file_name().and_then(|f| f.to_str()) != Some("k3s.yaml") {
+            cmd.arg("--kube-context").arg(Self::CONTEXT_NAME);
+        }
+        cmd
+    }
+
     /// Extended PATH that includes common binary locations.
     /// macOS app bundles have a minimal PATH that misses /opt/homebrew/bin.
     fn extended_path() -> String {
@@ -4433,6 +4451,11 @@ impl K8sManager for K3sManager {
 impl K3sManager {
     /// List installed Helm releases across all namespaces.
     pub async fn helm_list(&self) -> anyhow::Result<Vec<HelmRelease>> {
+        // No cluster, no releases: don't start helm only to wait for it to
+        // time out connecting (seconds per call).
+        if !self.status().await.is_ok_and(|s| s.running) {
+            return Ok(Vec::new());
+        }
         // Check if helm is available
         #[cfg(target_os = "windows")]
         let output = {
@@ -4444,11 +4467,8 @@ impl K3sManager {
 
         #[cfg(not(target_os = "windows"))]
         let output = {
-            let mut cmd = Command::new("helm");
+            let mut cmd = self.helm_command();
             cmd.args(["list", "-A", "-o", "json"]);
-            if self.kubeconfig_path().exists() {
-                cmd.env("KUBECONFIG", self.kubeconfig_path());
-            }
             cmd.output().await?
         };
 
@@ -4486,11 +4506,8 @@ impl K3sManager {
 
         #[cfg(not(target_os = "windows"))]
         let output = {
-            let mut cmd = Command::new("helm");
+            let mut cmd = self.helm_command();
             cmd.args(["uninstall", name, "-n", namespace]);
-            if self.kubeconfig_path().exists() {
-                cmd.env("KUBECONFIG", self.kubeconfig_path());
-            }
             cmd.output().await?
         };
 
@@ -4551,15 +4568,12 @@ impl K3sManager {
 
         #[cfg(not(target_os = "windows"))]
         let output = {
-            let mut cmd = Command::new("helm");
+            let mut cmd = self.helm_command();
             cmd.args(["install", release_name, chart, "-n", namespace, "--create-namespace"]);
             if let Some(vals) = set_values {
                 for v in vals {
                     cmd.args(["--set", v]);
                 }
-            }
-            if self.kubeconfig_path().exists() {
-                cmd.env("KUBECONFIG", self.kubeconfig_path());
             }
             cmd.output().await?
         };
