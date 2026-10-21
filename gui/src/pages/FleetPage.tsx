@@ -1,4 +1,4 @@
-import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createMemo, createEffect, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { useRefresh } from "../lib/useRefresh";
 import { formatBytes } from "../lib/format";

@@ -483,6 +483,7 @@ export default function App() {
     };
     startAndWait();
 
+    // eslint-disable-next-line solid/reactivity -- polled callback reads the current status
     const watchdog = startPoller(() => {
       if (daemonStatus() !== "connecting") return watchDaemon();
     }, 3000, { immediate: false });
