@@ -211,7 +211,7 @@ impl DaemonManager {
 
     /// Get the version of the running daemon, if available.
     async fn daemon_version(&self) -> Option<String> {
-        let resp = reqwest::Client::new()
+        let resp = local_client()
             .get("http://127.0.0.1:9477/api/v1/health")
             .timeout(std::time::Duration::from_secs(2))
             .send()
@@ -225,7 +225,7 @@ impl DaemonManager {
         // Be strict: verify the endpoint returned 2xx AND a valid JSON body
         // with a "status" field of "ok". This prevents false-positives when
         // an unrelated process binds port 9477.
-        let resp = match reqwest::Client::new()
+        let resp = match local_client()
             .get("http://127.0.0.1:9477/api/v1/health")
             .timeout(std::time::Duration::from_secs(2))
             .send()
@@ -337,4 +337,10 @@ fn daemon_binary_name() -> &'static str {
     } else {
         "orca-daemon"
     }
+}
+
+/// One client for the local daemon's health checks, reused across calls.
+fn local_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
 }

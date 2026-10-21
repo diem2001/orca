@@ -48,6 +48,7 @@ pub fn run() {
             commands::list_containers,
             commands::inspect_container,
             commands::container_stats,
+            commands::all_container_stats,
             commands::start_container,
             commands::stop_container,
             commands::exec_container,
@@ -333,8 +334,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
                 if _window.label() == "main" {
+                    use tauri::Emitter;
                     api.prevent_close();
                     let _ = _window.hide();
+                    // The GUI pauses its polling while nobody can see it.
+                    let _ = _window.emit("orca-window-visible", false);
                 }
             }
         })
@@ -363,8 +367,10 @@ pub fn run() {
                     && !has_visible_windows
                     && let Some(window) = _app.get_webview_window("main")
                 {
+                    use tauri::Emitter;
                     let _ = window.show();
                     let _ = window.set_focus();
+                    let _ = window.emit("orca-window-visible", true);
                 }
             }
         });

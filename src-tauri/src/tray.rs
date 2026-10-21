@@ -1,5 +1,5 @@
 use tauri::{
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
     menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -96,11 +96,13 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
+                    let _ = window.emit("orca-window-visible", true);
                 }
             }
             "hide" => {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
+                    let _ = window.emit("orca-window-visible", false);
                 }
             }
             "quit" => {
@@ -124,6 +126,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
+                    let _ = window.emit("orca-window-visible", true);
                 }
             }
         })

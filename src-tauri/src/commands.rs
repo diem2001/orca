@@ -150,7 +150,31 @@ fn authed_client() -> reqwest::Client {
 /// Build an authed client with a custom timeout (in seconds).
 /// Use this for long-running operations (image pull, K8s enable, AI queries, etc.)
 /// Pass 0 for no timeout (useful for SSE streaming connections).
+///
+/// Clients are reused per timeout until the active host changes, so calls
+/// share a connection pool: a fresh client per call meant a new TCP (and for
+/// a remote host, TLS) connection for every poll.
 fn authed_client_with_timeout(timeout_secs: u64) -> reqwest::Client {
+    type Key = (u64, Option<(String, String, bool)>);
+    static CLIENTS: OnceLock<Mutex<HashMap<u64, (Key, reqwest::Client)>>> = OnceLock::new();
+
+    let host = DAEMON_URL_OVERRIDE.read().ok().and_then(|g| g.clone());
+    let key: Key = (timeout_secs, host);
+    let clients = CLIENTS.get_or_init(Default::default);
+    if let Ok(map) = clients.lock()
+        && let Some((cached_key, client)) = map.get(&timeout_secs)
+        && *cached_key == key
+    {
+        return client.clone();
+    }
+    let client = build_authed_client(timeout_secs);
+    if let Ok(mut map) = clients.lock() {
+        map.insert(timeout_secs, (key, client.clone()));
+    }
+    client
+}
+
+fn build_authed_client(timeout_secs: u64) -> reqwest::Client {
     let mut builder = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
 
     if timeout_secs > 0 {
@@ -317,6 +341,12 @@ pub async fn inspect_container(id: String) -> Result<serde_json::Value, String> 
 #[tauri::command]
 pub async fn container_stats(id: String) -> Result<serde_json::Value, String> {
     get_json(&format!("/containers/{}/stats", urlencoding::encode(&id))).await
+}
+
+/// Stats of all running containers in one request.
+#[tauri::command]
+pub async fn all_container_stats() -> Result<serde_json::Value, String> {
+    get_json("/containers/stats").await
 }
 
 #[tauri::command]
@@ -3928,18 +3958,20 @@ pub async fn probe_host(host_id: Option<String>) -> Result<serde_json::Value, St
 pub async fn probe_all_hosts() -> Result<Vec<serde_json::Value>, String> {
     let config = orca_core::config::OrcaConfig::load().map_err(|e| format!("{e}"))?;
 
-    // Two clients: one that verifies TLS, one that doesn't
-    let verify_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let noverify_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    // Two clients: one that verifies TLS, one that doesn't. Kept for the
+    // app's lifetime: this runs every minute.
+    static PROBE_CLIENTS: OnceLock<(reqwest::Client, reqwest::Client)> = OnceLock::new();
+    let (verify_client, noverify_client) = PROBE_CLIENTS.get_or_init(|| {
+        let build = |verify: bool| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .danger_accept_invalid_certs(!verify)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        };
+        (build(true), build(false))
+    });
 
     let mut results = Vec::new();
 
