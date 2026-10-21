@@ -8466,8 +8466,8 @@ async fn gateway_traefik_status(State(state): State<Arc<AppState>>) -> Result<im
         )
     };
 
-    let k8s = &state.k8s;
-    let traefik_info = k8s.get_traefik_service_info().await.ok().flatten();
+    // Cached for a while: the Kubernetes page polls this every few seconds.
+    let (traefik_info, ingress_hostnames) = state.k8s.traefik_overview().await;
     let traefik_detected = traefik_info.is_some();
 
     // Check if Traefik is reachable (try hitting it)
@@ -8487,8 +8487,6 @@ async fn gateway_traefik_status(State(state): State<Arc<AppState>>) -> Result<im
             "node_ports": info.node_ports,
         })
     });
-
-    let ingress_hostnames: Vec<_> = k8s.list_all_ingress_hostnames().await.unwrap_or_default();
 
     Ok(Json(serde_json::json!({
         "mode": mode,
