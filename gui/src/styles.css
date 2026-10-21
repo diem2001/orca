@@ -71,6 +71,13 @@ pre, code, .mono, .selectable, .log-content,
   -webkit-user-select: text;
 }
 
+/* Status dots that are checking or starting (Fleet, containers table).
+   Opacity only, so it stays on the compositor. */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 /* ==================== App Layout ==================== */
 .app-root {
   display: flex;
@@ -241,9 +248,10 @@ pre, code, .mono, .selectable, .log-content,
   justify-content: space-between;
   align-items: center;
   height: 46px;
-  background: rgba(18, 22, 30, 0.85);
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  /* The colour rgba(18, 22, 30, 0.85) gave over .app-root's background. No
+     backdrop blur: nothing scrolls under the titlebar, and a blur layer is
+     recomposited on every repaint. */
+  background: #11151d;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   padding: 0 10px 0 14px;
   user-select: none;
@@ -436,9 +444,8 @@ pre, code, .mono, .selectable, .log-content,
 /* ==================== Sidebar ==================== */
 .sidebar {
   width: 220px;
-  background: rgba(16, 20, 28, 0.75);
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  /* rgba(16, 20, 28, 0.75) over .app-root's background; see .titlebar. */
+  background: #0f131a;
   border-right: 1px solid rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
@@ -983,10 +990,10 @@ input[type="checkbox"]:checked::after {
 }
 
 /* ==================== Cards ==================== */
+/* Cards sit on .app-main's flat background, so a backdrop blur only cost a
+   filter layer per card, recomputed while scrolling. */
 .card {
   background: rgba(22, 27, 34, 0.65);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 10px;
   padding: 20px;
@@ -2084,7 +2091,6 @@ select option {
   border: 1px solid #21262d;
   border-radius: 10px;
   padding: 16px;
-  backdrop-filter: blur(8px);
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -2529,8 +2535,6 @@ select option {
 
 .dashboard-stat-card {
   background: rgba(22, 27, 34, 0.6);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 12px;
   padding: 20px;

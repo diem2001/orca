@@ -755,12 +755,7 @@ export default function FleetPage(props: FleetPageProps) {
         />
       </Show>
 
-      {/* Pulse animation for checking state */}
       <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.3; }
-        }
         .fleet-card:active {
           transform: scale(0.98) !important;
         }

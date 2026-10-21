@@ -5,6 +5,7 @@ import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import { showToast } from "../components/Toast";
 import { useRefresh } from "../lib/useRefresh";
 import { usePoller } from "../lib/poller";
+import { keepUnchanged } from "../lib/keepUnchanged";
 import { appVisible } from "../lib/visibility";
 import { confirmDanger } from "../components/ConfirmDialog";
 import { logError, logInfo } from "../lib/activityStore";
@@ -197,7 +198,7 @@ export default function KubernetesPage() {
         try {
           const ns = (await invoke("k8s_namespaces")) as Namespace[];
           if (ns.length > 0) {
-            setNamespaces(ns);
+            setNamespaces((prev) => keepUnchanged(prev, ns));
             // Only auto-select on first load (when still on default with no data)
             if (!ns.find((n: Namespace) => n.name === selectedNs()) && namespaces().length === 0) {
               setSelectedNs(ns[0].name);
@@ -206,10 +207,10 @@ export default function KubernetesPage() {
         } catch {
           // If namespace listing fails and we have nothing, provide defaults
           if (namespaces().length === 0) {
-            setNamespaces([
+            setNamespaces((prev) => keepUnchanged(prev, [
               { name: "default", status: "Active", age: "" },
               { name: "kube-system", status: "Active", age: "" },
-            ]);
+            ]));
           }
         }
         // Detect Traefik service in kube-system
@@ -260,7 +261,7 @@ export default function KubernetesPage() {
           invoke("k8s_pod_metrics", { namespace: ns }) as Promise<PodMetrics[]>,
         ]);
         if (stale()) return;
-        if (podResult.status === "fulfilled") setPods(podResult.value);
+        if (podResult.status === "fulfilled") setPods((prev) => keepUnchanged(prev, podResult.value));
         if (metricsResult.status === "fulfilled") {
           const map: Record<string, PodMetrics> = {};
           for (const m of metricsResult.value) {
@@ -274,20 +275,20 @@ export default function KubernetesPage() {
           invoke("k8s_hpas", { namespace: ns }) as Promise<HorizontalPodAutoscaler[]>,
         ]);
         if (stale()) return;
-        if (depResult.status === "fulfilled") setDeployments(depResult.value);
-        if (hpaResult.status === "fulfilled") setHpas(hpaResult.value);
+        if (depResult.status === "fulfilled") setDeployments((prev) => keepUnchanged(prev, depResult.value));
+        if (hpaResult.status === "fulfilled") setHpas((prev) => keepUnchanged(prev, hpaResult.value));
       } else if (myTab === "services") {
         const [svcResult, npResult] = await Promise.allSettled([
           invoke("k8s_services", { namespace: ns }) as Promise<K8sService[]>,
           invoke("k8s_network_policies", { namespace: ns }) as Promise<NetworkPolicy[]>,
         ]);
         if (stale()) return;
-        if (svcResult.status === "fulfilled") setServices(svcResult.value);
-        if (npResult.status === "fulfilled") setNetworkPolicies(npResult.value);
+        if (svcResult.status === "fulfilled") setServices((prev) => keepUnchanged(prev, svcResult.value));
+        if (npResult.status === "fulfilled") setNetworkPolicies((prev) => keepUnchanged(prev, npResult.value));
       } else if (myTab === "ingresses") {
         const result = (await invoke("k8s_ingresses", { namespace: ns })) as Ingress[];
         if (stale()) return;
-        setIngresses(result);
+        setIngresses((prev) => keepUnchanged(prev, result));
       } else if (myTab === "storage") {
         const [pvcResult, pvResult, scResult] = await Promise.allSettled([
           invoke("k8s_pvcs", { namespace: ns }) as Promise<PersistentVolumeClaim[]>,
@@ -295,25 +296,25 @@ export default function KubernetesPage() {
           invoke("k8s_storage_classes") as Promise<StorageClass[]>,
         ]);
         if (stale()) return;
-        if (pvcResult.status === "fulfilled") setPvcs(pvcResult.value);
-        if (pvResult.status === "fulfilled") setPvs(pvResult.value);
-        if (scResult.status === "fulfilled") setStorageClasses(scResult.value);
+        if (pvcResult.status === "fulfilled") setPvcs((prev) => keepUnchanged(prev, pvcResult.value));
+        if (pvResult.status === "fulfilled") setPvs((prev) => keepUnchanged(prev, pvResult.value));
+        if (scResult.status === "fulfilled") setStorageClasses((prev) => keepUnchanged(prev, scResult.value));
       } else if (myTab === "crds") {
         const result = (await invoke("k8s_crds")) as CustomResourceDefinition[];
         if (stale()) return;
-        setCrds(result);
+        setCrds((prev) => keepUnchanged(prev, result));
       } else if (myTab === "events") {
         const result = (await invoke("k8s_events", { namespace: ns })) as K8sEvent[];
         if (stale()) return;
-        setEvents(result);
+        setEvents((prev) => keepUnchanged(prev, result));
       } else if (myTab === "config") {
         const [cmResult, secResult] = await Promise.all([
           invoke("k8s_configmaps", { namespace: ns }) as Promise<K8sConfigMap[]>,
           invoke("k8s_secrets", { namespace: ns }) as Promise<K8sSecret[]>,
         ]);
         if (stale()) return;
-        setConfigMaps(cmResult);
-        setSecrets(secResult);
+        setConfigMaps((prev) => keepUnchanged(prev, cmResult));
+        setSecrets((prev) => keepUnchanged(prev, secResult));
       } else if (myTab === "helm") {
         try {
           if (helmAvailable() === null) {
@@ -324,7 +325,7 @@ export default function KubernetesPage() {
           if (helmAvailable()) {
             const releases = (await invoke("k8s_helm_list")) as HelmRelease[];
             if (stale()) return;
-            setHelmReleases(releases);
+            setHelmReleases((prev) => keepUnchanged(prev, releases));
           }
         } catch { /* helm not available */ }
       } else if (myTab === "jobs") {
@@ -333,20 +334,20 @@ export default function KubernetesPage() {
           invoke("k8s_cronjobs", { namespace: ns }) as Promise<K8sCronJob[]>,
         ]);
         if (stale()) return;
-        setJobs(jobData);
-        setCronJobs(cronData);
+        setJobs((prev) => keepUnchanged(prev, jobData));
+        setCronJobs((prev) => keepUnchanged(prev, cronData));
       } else if (myTab === "daemonsets") {
         const result = (await invoke("k8s_daemonsets", { namespace: ns })) as K8sDaemonSet[];
         if (stale()) return;
-        setDaemonSets(result);
+        setDaemonSets((prev) => keepUnchanged(prev, result));
       } else if (myTab === "statefulsets") {
         const result = (await invoke("k8s_statefulsets", { namespace: ns })) as K8sStatefulSet[];
         if (stale()) return;
-        setStatefulSets(result);
+        setStatefulSets((prev) => keepUnchanged(prev, result));
       } else if (myTab === "replicasets") {
         const result = (await invoke("k8s_replicasets", { namespace: ns })) as K8sReplicaSet[];
         if (stale()) return;
-        setReplicaSets(result);
+        setReplicaSets((prev) => keepUnchanged(prev, result));
       } else if (myTab === "topology") {
         // Topology needs pods, deployments, services, and optionally metrics
         const [p, d, svcT, m] = await Promise.allSettled([
@@ -356,9 +357,9 @@ export default function KubernetesPage() {
           invoke("k8s_pod_metrics", { namespace: ns }) as Promise<PodMetrics[]>,
         ]);
         if (stale()) return;
-        if (p.status === "fulfilled") setPods(p.value);
-        if (d.status === "fulfilled") setDeployments(d.value);
-        if (svcT.status === "fulfilled") setServices(svcT.value);
+        if (p.status === "fulfilled") setPods((prev) => keepUnchanged(prev, p.value));
+        if (d.status === "fulfilled") setDeployments((prev) => keepUnchanged(prev, d.value));
+        if (svcT.status === "fulfilled") setServices((prev) => keepUnchanged(prev, svcT.value));
         if (m.status === "fulfilled") {
           const map: Record<string, PodMetrics> = {};
           for (const met of m.value) map[met.name] = met;

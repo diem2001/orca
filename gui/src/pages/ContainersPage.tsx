@@ -244,7 +244,8 @@ export default function ContainersPage(props: ContainersPageProps) {
   };
 
   // Group containers by compose project label
-  const grouped = (): { stackGroups: StackGroup[]; standalone: Container[] } => {
+  let previousGroups = new Map<string, StackGroup>();
+  const grouped = createMemo((): { stackGroups: StackGroup[]; standalone: Container[] } => {
     const allContainers = containers();
     const stackMap = new Map<string, ComposeProject>();
     for (const s of stacks()) {
@@ -268,18 +269,28 @@ export default function ContainersPage(props: ContainersPageProps) {
     }
 
     const groups: StackGroup[] = [];
+    const next = new Map<string, StackGroup>();
     for (const [name, ctrs] of projectContainers) {
-      groups.push({
-        name,
-        containers: ctrs,
-        composeProject: stackMap.get(name),
-      });
+      // Keep a group's object while its members are the same, so <For>
+      // keeps its card (the rows inside update on their own).
+      const prev = previousGroups.get(name);
+      const composeProject = stackMap.get(name);
+      const group =
+        prev &&
+        prev.composeProject === composeProject &&
+        prev.containers.length === ctrs.length &&
+        prev.containers.every((c, i) => c === ctrs[i])
+          ? prev
+          : { name, containers: ctrs, composeProject };
+      next.set(name, group);
+      groups.push(group);
     }
+    previousGroups = next;
     // Sort stack groups alphabetically
     groups.sort((a, b) => a.name.localeCompare(b.name));
 
     return { stackGroups: groups, standalone: standaloneList };
-  };
+  });
 
   // Apply search + state filter to a list of containers
   const applyFilters = (list: Container[]): Container[] => {
@@ -309,12 +320,23 @@ export default function ContainersPage(props: ContainersPageProps) {
     return applyFilters(group.containers).length > 0;
   };
 
-  const filteredGroups = () => {
+  const filteredGroups = createMemo(() => {
     const { stackGroups, standalone } = grouped();
     const filteredStacks = stackGroups.filter(stackPassesFilter);
     const filteredStandalone = applyFilters(standalone);
     return { stackGroups: filteredStacks, standalone: filteredStandalone };
-  };
+  });
+
+  // Gateway routes by container name, for the hostname badges on each row.
+  const routesByContainer = createMemo(() => {
+    const map = new Map<string, Array<{ hostname: string; container_name: string; port: number }>>();
+    for (const r of gatewayRoutes()) {
+      const list = map.get(r.container_name);
+      if (list) list.push(r);
+      else map.set(r.container_name, [r]);
+    }
+    return map;
+  });
 
   const toggleSelect = (id: string, e: MouseEvent) => {
     e.stopPropagation();
@@ -586,7 +608,7 @@ export default function ContainersPage(props: ContainersPageProps) {
           <span style={{ "font-weight": "500", "margin-left": "6px" }} title={c.name}>
             {shortName(c, stackName)}
           </span>
-          <For each={gatewayRoutes().filter((r) => r.container_name === c.name)}>
+          <For each={routesByContainer().get(c.name) ?? []}>
             {(route) => (
               <span
                 style={{

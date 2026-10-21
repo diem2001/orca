@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
 
 export interface TimeChartProps {
   data: Array<{ time: number; value: number }>;
@@ -29,13 +29,16 @@ export default function TimeChart(props: TimeChartProps) {
   const chartWidth = () => WIDTH - padding().left - padding().right;
   const chartHeight = () => height() - padding().top - padding().bottom;
 
-  const maxVal = () => {
+  // Geometry is memoised: the paths, axes and hover all read it, and the
+  // dashboard redraws several charts on every stats poll.
+  const maxVal = createMemo(() => {
     if (props.maxValue != null && props.maxValue > 0) return props.maxValue;
-    const vals = props.data.map((d) => d.value);
-    return Math.max(...vals, 1);
-  };
+    let max = 1;
+    for (const d of props.data) if (d.value > max) max = d.value;
+    return max;
+  });
 
-  const pts = () => {
+  const pts = createMemo(() => {
     const data = props.data;
     if (data.length === 0) return [];
     const cw = chartWidth();
@@ -47,9 +50,9 @@ export default function TimeChart(props: TimeChartProps) {
       x: pad.left + i * xScale,
       y: pad.top + ch - (Math.min(d.value, mv) / mv) * ch,
     }));
-  };
+  });
 
-  const linePath = () => {
+  const linePath = createMemo(() => {
     const points = pts();
     if (points.length < 2) return "";
     let path = `M ${points[0].x} ${points[0].y}`;
@@ -60,9 +63,9 @@ export default function TimeChart(props: TimeChartProps) {
       path += ` C ${cp1x} ${points[i - 1].y}, ${cp2x} ${points[i].y}, ${points[i].x} ${points[i].y}`;
     }
     return path;
-  };
+  });
 
-  const areaPath = () => {
+  const areaPath = createMemo(() => {
     const line = linePath();
     if (!line) return "";
     const points = pts();
@@ -70,7 +73,7 @@ export default function TimeChart(props: TimeChartProps) {
     const firstX = points[0].x;
     const bottom = padding().top + chartHeight();
     return `${line} L ${lastX} ${bottom} L ${firstX} ${bottom} Z`;
-  };
+  });
 
   const gradientId = () => `timechart-grad-${(props.color || "#58a6ff").replace("#", "")}`;
 
